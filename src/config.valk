@@ -1,0 +1,97 @@
+use valk.url
+
+/// TLS settings for a NATS connection.
+///
+/// The defaults verify the server certificate against the system CA bundle. For a self-signed
+/// server certificate, pass `ca_file` or set `verify: false` (which disables certificate checks).
+/// Set `certificate_file` and `private_key_file` for mutual TLS.
++ class TlsOptions {
+    /// Whether the server certificate is verified.
+    + verify: bool (true)
+    /// A PEM file with certificate authorities to trust instead of the system bundle.
+    + ca_file: ?String (null)
+    /// A directory of certificate authorities to trust instead of the system bundle.
+    + ca_dir: ?String (null)
+    /// The hostname to verify the certificate against and send as SNI; empty uses the server host.
+    + host: String ("")
+    /// A PEM file with the client certificate, sent when the server requests one.
+    + certificate_file: ?String (null)
+    /// The PEM private key for `certificate_file`; null reads it from `certificate_file`.
+    + private_key_file: ?String (null)
+    /// Password for an encrypted client private key.
+    + key_password: String ("")
+}
+
+/// Settings for opening a NATS client connection.
++ class Config {
+    /// Host name or IP address of the NATS server.
+    + host: String ("127.0.0.1")
+    /// Port of the NATS server.
+    + port: u32 (4222)
+    /// Optional client name sent in `CONNECT`.
+    + name: String ("")
+    /// Username for user/pass authentication.
+    + user: String ("")
+    /// Password for user/pass authentication.
+    + pass: String ("")
+    /// Token for token authentication.
+    + auth_token: String ("")
+    /// Ask the server to acknowledge every command with `+OK`.
+    + verbose: bool (false)
+    /// Ask the server to run strict protocol checks.
+    + pedantic: bool (false)
+    /// Whether messages published by this client are echoed back to its own subscriptions.
+    + echo: bool (true)
+    /// Advertise NATS 2.2+ header (`HPUB`/`HMSG`) support in `CONNECT`.
+    + headers: bool (true)
+    /// Connect, TLS handshake, and write timeout in milliseconds.
+    + timeout_ms: uint (5000)
+    /// TLS settings, or null for a plain connection (still upgraded if server sets `tls_required`).
+    + tls: ?TlsOptions (null)
+}
+
+/// Parses a `nats://` or `tls://` URL into a `Config`.
+///
+/// Supports credentials in the URL: `nats://user:pass@host:4222` sets `user` and `pass`,
+/// while `nats://token@host:4222` sets `auth_token`. `tls://` enables TLS with default options.
++ fn config_from_url(text: String, timeout_ms: uint (5000)) Config !Error {
+    let raw = text.contains("://") ? text : "nats://" + text
+    let parts = url.parse(raw)
+    let tls: ?TlsOptions = null
+    if parts.scheme == "tls" : tls = TlsOptions {}
+    else if parts.scheme != "nats" {
+        throw .connect { message: "'%{parts.scheme}' is not a valid NATS URL scheme" }
+    }
+
+    let decoded_user = url.decode(parts.user)
+    let decoded_pass = url.decode(parts.password)
+    let user = ""
+    let pass = ""
+    let auth_token = ""
+    if decoded_user.length > 0 && decoded_pass.length == 0 {
+        auth_token = decoded_user
+    } else {
+        user = decoded_user
+        pass = decoded_pass
+    }
+
+    return Config {
+        host: parts.host.length > 0 ? parts.host.trim("[").trim("]") : "127.0.0.1"
+        port: (parts.port ?? 4222).to(u32)
+        user: user
+        pass: pass
+        auth_token: auth_token
+        timeout_ms: timeout_ms
+        tls: tls
+    }
+}
+
+/// Connects to a NATS server described by `url` (default `nats://127.0.0.1:4222`).
++ fn connect(url: String ("nats://127.0.0.1:4222"), timeout_ms: uint (5000)) Client !Error {
+    return Client.connect(url, timeout_ms) !>
+}
+
+/// Connects to a NATS server using `config`.
++ fn connect_with(config: Config) Client !Error {
+    return Client.connect_with(config) !>
+}

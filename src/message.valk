@@ -1,0 +1,33 @@
+/// A message received from a NATS subscription or request reply.
++ class Message {
+    /// Subject the message was published to.
+    + subject: String
+    /// Optional reply subject for request/reply; empty when absent.
+    + reply: String ("")
+    /// Message payload bytes.
+    + payload: String ("")
+    /// NATS/1.0 headers attached to the message (empty for plain `MSG` frames).
+    + headers: Map[String] (.{})
+    /// Subscription identifier that received this message.
+    + sid: uint (0)
+    /// Optional status code from the NATS/1.0 header line (for example `"503"`), or `""`.
+    + status: String ("")
+    client: ?Client (null)
+
+    /// Returns the header value for `name`, or null when absent.
+    + fn header(name: String) ?String {
+        return this.headers.get(name) !? null
+    }
+
+    /// Publishes `payload` (and optional `headers`) back to `this.reply`.
+    ///
+    /// Throws `invalid_subject` when the message has no reply subject, or `closed` if the
+    /// client is closed.
+    + fn respond(payload: String, headers: ?Map[String] (null)) !Error {
+        if this.reply.length == 0 {
+            throw .invalid_subject { message: "Cannot respond to message on '%{this.subject}': no reply subject" }
+        }
+        let client = this.client ?! throw .closed { message: "Message is not associated with an active client" }
+        client.publish(this.reply, payload, "", headers) !>
+    }
+}

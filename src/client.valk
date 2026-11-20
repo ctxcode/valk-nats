@@ -1,0 +1,739 @@
+use valk.net
+use valk.sync
+
+value RECV_CHUNK (65536)
+
+class InboxWaiter {
+    ready: sync.Channel[bool]
+    msg: ?Message (null)
+}
+
+/// A NATS client connection with background message dispatching.
+///
+/// Supports pub/sub, queue groups, NATS/1.0 headers (`HPUB`/`HMSG`), request/reply over an
+/// internal wildcard inbox, `PING`/`PONG` synchronization via `flush`, graceful `drain`,
+/// and TLS upgrades.
++ class Client {
+    /// Settings this client was opened with.
+    + config: Config
+    /// Latest server metadata received from `INFO`.
+    ~ info: ServerInfo
+    /// Whether this connection is running over TLS.
+    ~ tls_active: bool (false)
+    /// Whether the client has been closed or disconnected.
+    ~ closed: bool (false)
+    /// Whether `drain` is currently in progress.
+    ~ draining: bool (false)
+    /// Most recent `-ERR` message received from the server, or `""`.
+    ~ last_error: String ("")
+
+    - con: net.TcpConnection
+    - cancel: sync.CancelToken
+    - write_sem: sync.Semaphore
+    - data_in: ByteBuffer (.new())
+    - read_offset: uint (0)
+    - next_sid: uint (1)
+    - subs: HashMap[uint, Subscription] (.{})
+    - pongs: Deque[sync.Channel[bool]] (.{})
+    - pending_err: String ("")
+    - inbox_sid: uint (0)
+    - inbox_prefix: String ("")
+    - inbox_seq: uint (0)
+    - inbox_waiters: Map[InboxWaiter] (.{})
+
+    // A client owns a socket; cloning returns the same client handle.
+    fn clone() SELF {
+        return this
+    }
+
+    /// Connects to a NATS server described by `url` (such as `nats://127.0.0.1:4222` or
+    /// `tls://user:pass@host:4222`).
+    + static fn connect(url: String ("nats://127.0.0.1:4222"), timeout_ms: uint (5000)) Client !Error {
+        let cfg = config_from_url(url, timeout_ms) !>
+        return SELF.connect_with(cfg) !>
+    }
+
+    /// Connects to a NATS server using `config`, performs the `INFO` / TLS / `CONNECT`
+    /// handshake, and starts the background reader coroutine.
+    + static fn connect_with(config: Config) Client !Error {
+        let sock = net.tcp_client(config.host, config.port.to(u16), config.timeout_ms) ! {
+            throw .connect { message: "Failed to connect to %{config.host}:%{config.port}" }
+        }
+        sock.set_timeouts(config.timeout_ms, config.timeout_ms)
+
+        let cancel = sync.CancelToken.new() ! {
+            sock.close() _
+            throw .connect { message: "Failed to initialize cancel token" }
+        }
+        let write_sem = sync.Semaphore.new(1) ! {
+            sock.close() _
+            throw .connect { message: "Failed to initialize write lock" }
+        }
+
+        let client = Client {
+            config: config
+            info: ServerInfo {}
+            con: sock
+            cancel: cancel
+            write_sem: write_sem
+        }
+
+        client.handshake() ! {
+            client.closed = true
+            sock.close() _
+            throw E
+        }
+
+        // Background reader waits indefinitely for incoming frames; writes keep the configured timeout.
+        sock.set_timeouts(0, config.timeout_ms)
+        sock.set_cancel(cancel)
+        co client.read_loop()
+        return client
+    }
+
+    /// Publishes `payload` to `subject`, with optional `reply` subject and NATS/1.0 `headers`.
+    + fn publish(subject: String, payload: String, reply: String (""), headers: ?Map[String] (null)) !Error {
+        if this.closed : throw .closed { message: "The NATS client is closed" }
+        if !is_valid_subject(subject) {
+            throw .invalid_subject { message: "Invalid publish subject '%{subject}'" }
+        }
+        if reply.length > 0 && !is_valid_subject(reply) {
+            throw .invalid_subject { message: "Invalid reply subject '%{reply}'" }
+        }
+
+        let buf = ByteBuffer.new()
+        if isset(headers) && headers.length > 0 {
+            let hdr_raw = encode_headers(headers) !>
+            let total_bytes = hdr_raw.length + payload.length
+            if this.info.max_payload > 0 && total_bytes > this.info.max_payload {
+                throw .protocol { message: "Message size %{total_bytes} exceeds server max_payload %{this.info.max_payload}" }
+            }
+            buf.write("HPUB ")
+            buf.write(subject)
+            buf.write_byte(' ')
+            if reply.length > 0 {
+                buf.write(reply)
+                buf.write_byte(' ')
+            }
+            buf.write_uint_ascii(hdr_raw.length)
+            buf.write_byte(' ')
+            buf.write_uint_ascii(total_bytes)
+            buf.write("\r\n")
+            buf.write(hdr_raw)
+            buf.write(payload)
+            buf.write("\r\n")
+        } else {
+            if this.info.max_payload > 0 && payload.length > this.info.max_payload {
+                throw .protocol { message: "Payload size %{payload.length} exceeds server max_payload %{this.info.max_payload}" }
+            }
+            buf.write("PUB ")
+            buf.write(subject)
+            buf.write_byte(' ')
+            if reply.length > 0 {
+                buf.write(reply)
+                buf.write_byte(' ')
+            }
+            buf.write_uint_ascii(payload.length)
+            buf.write("\r\n")
+            buf.write(payload)
+            buf.write("\r\n")
+        }
+
+        this.write_raw(buf) !>
+    }
+
+    /// Subscribes to `subject` (supporting `*` and `>` wildcards), optionally in `queue` group.
+    + fn subscribe(subject: String, queue: String ("")) Subscription !Error {
+        if this.closed || this.draining : throw .closed { message: "The NATS client is closed" }
+        if !is_valid_sub_subject(subject) {
+            throw .invalid_subject { message: "Invalid subscription subject '%{subject}'" }
+        }
+        if queue.length > 0 && !is_valid_queue(queue) {
+            throw .invalid_subject { message: "Invalid queue group '%{queue}'" }
+        }
+
+        let ready = sync.Channel[bool].new() ! {
+            throw .connect { message: "Failed to create subscription channel" }
+        }
+        let sid = this.next_sid++
+        let sub = Subscription {
+            subject: subject
+            queue: queue
+            sid: sid
+            client: this
+            ready: ready
+        }
+        this.subs.set(sid, sub)
+
+        let buf = ByteBuffer.new()
+        buf.write("SUB ")
+        buf.write(subject)
+        buf.write_byte(' ')
+        if queue.length > 0 {
+            buf.write(queue)
+            buf.write_byte(' ')
+        }
+        buf.write_uint_ascii(sid)
+        buf.write("\r\n")
+
+        this.write_raw(buf) ! {
+            this.subs.remove(sid)
+            sub.close_immediate()
+            throw E
+        }
+        return sub
+    }
+
+    /// Sends a request to `subject` and waits up to `timeout_ms` for a single reply message.
+    ///
+    /// Uses an internal wildcard `_INBOX.<random>.*` subscription multiplexed across requests.
+    + fn request(subject: String, payload: String, timeout_ms: uint (5000), headers: ?Map[String] (null)) Message !Error {
+        if this.closed || this.draining : throw .closed { message: "The NATS client is closed" }
+        if !is_valid_subject(subject) {
+            throw .invalid_subject { message: "Invalid request subject '%{subject}'" }
+        }
+
+        this.ensure_inbox() !>
+
+        this.inbox_seq++
+        let reply = this.inbox_prefix + "." + this.inbox_seq
+        let ready = sync.Channel[bool].new(1) ! {
+            throw .connect { message: "Failed to create request channel" }
+        }
+        let waiter = InboxWaiter { ready: ready }
+        this.inbox_waiters.set(reply, waiter)
+
+        this.publish(subject, payload, reply, headers) ! {
+            this.inbox_waiters.remove(reply)
+            throw E
+        }
+
+        waiter.ready.recv(timeout_ms) ! {
+            this.inbox_waiters.remove(reply)
+            if error_is(E.code, timeout) {
+                throw .timeout { message: "Request to '%{subject}' timed out after %{timeout_ms}ms" }
+            }
+            throw .closed { message: "Connection closed while waiting for reply to '%{subject}'" }
+        }
+        this.inbox_waiters.remove(reply)
+
+        let msg = waiter.msg ?! throw .closed { message: "Connection closed while waiting for reply to '%{subject}'" }
+        if msg.status == "503" {
+            throw .server { message: "No responders available for '%{subject}'" }
+        }
+        return msg
+    }
+
+    /// Sends a `PING` to the server and waits for the matching `PONG` round-trip.
+    ///
+    /// Guarantees that all prior `PUB`, `HPUB`, `SUB`, and `UNSUB` commands have been processed
+    /// by the server. Throws `timeout` if no `PONG` arrives within `timeout_ms`.
+    + fn flush(timeout_ms: uint (5000)) !Error {
+        if this.closed : throw .closed { message: "The NATS client is closed" }
+        let ch = sync.Channel[bool].new(1) ! {
+            throw .connect { message: "Failed to create flush waiter" }
+        }
+        this.pongs.push_back(ch)
+        this.write_raw("PING\r\n") ! {
+            ch.close()
+            throw E
+        }
+        let ok = ch.recv(timeout_ms) ! {
+            if error_is(E.code, timeout) {
+                throw .timeout { message: "Flush timed out waiting for PONG after %{timeout_ms}ms" }
+            }
+            this.throw_disconnect_error() !>
+        }
+        if !ok : this.throw_disconnect_error() !>
+        if this.pending_err.length > 0 {
+            let msg = this.pending_err
+            this.pending_err = ""
+            if is_auth_error(msg) : throw .auth { message: msg }
+            throw .server { message: msg }
+        }
+    }
+
+    /// Gracefully drains all active subscriptions, flushes in-flight messages into their queues,
+    /// and closes the connection.
+    + fn drain(timeout_ms: uint (5000)) !Error {
+        if this.closed || this.draining : return
+        this.draining = true
+
+        // Send UNSUB for every active user subscription and the request inbox mux
+        let buf = ByteBuffer.new()
+        let active_subs = Array[Subscription]{}
+        each this.subs as sub, sid {
+            active_subs.append(sub)
+            buf.write("UNSUB ")
+            buf.write_uint_ascii(sid)
+            buf.write("\r\n")
+        }
+        if this.inbox_sid > 0 {
+            buf.write("UNSUB ")
+            buf.write_uint_ascii(this.inbox_sid)
+            buf.write("\r\n")
+            this.inbox_sid = 0
+        }
+        if buf.length > 0 {
+            this.write_raw(buf) ! {
+                this.close()
+                throw E
+            }
+        }
+
+        // Wait for the server to process all UNSUBs and deliver any in-flight messages
+        this.flush(timeout_ms) ! {
+            each active_subs as sub : sub.finish()
+            this.subs.clear()
+            this.close()
+            throw E
+        }
+
+        // Finish all subscriptions without dropping buffered messages
+        each active_subs as sub : sub.finish()
+        this.subs.clear()
+
+        // Close any waiting requests and close the underlying connection
+        this.close_waiters()
+        this.closed = true
+        this.cancel.cancel()
+        this.con.close() _
+    }
+
+    /// Immediately closes the connection and every active subscription.
+    + fn close() {
+        if this.closed : return
+        this.closed = true
+        this.draining = false
+        each this.subs as sub {
+            sub.close_immediate()
+        }
+        this.subs.clear()
+        this.close_waiters()
+        this.cancel.cancel()
+        this.con.close() _
+    }
+
+    //
+    // Internal subscription helpers
+    //
+
+    fn unsubscribe_sub(sub: Subscription, max_msgs: uint) !Error {
+        if sub.closed : return
+        if this.closed : throw .closed { message: "The NATS client is closed" }
+
+        let buf = ByteBuffer.new()
+        buf.write("UNSUB ")
+        buf.write_uint_ascii(sub.sid)
+        if max_msgs > 0 {
+            buf.write_byte(' ')
+            buf.write_uint_ascii(max_msgs)
+        }
+        buf.write("\r\n")
+        this.write_raw(buf) !>
+
+        if max_msgs == 0 {
+            this.subs.remove(sub.sid)
+            sub.close_immediate()
+        } else {
+            if sub.set_max_msgs(max_msgs) : this.subs.remove(sub.sid)
+        }
+    }
+
+    fn drain_sub(sub: Subscription, timeout_ms: uint) !Error {
+        if sub.closed : return
+        if this.closed : throw .closed { message: "The NATS client is closed" }
+
+        let buf = ByteBuffer.new()
+        buf.write("UNSUB ")
+        buf.write_uint_ascii(sub.sid)
+        buf.write("\r\n")
+        this.write_raw(buf) !>
+
+        // Ensure all messages sent before UNSUB have arrived in sub's queue
+        this.flush(timeout_ms) ! {
+            this.subs.remove(sub.sid)
+            sub.finish()
+            throw E
+        }
+        this.subs.remove(sub.sid)
+        sub.finish()
+    }
+
+    fn ensure_inbox() !Error {
+        if this.inbox_sid > 0 : return
+        let prefix = new_inbox()
+        let sid = this.next_sid++
+        this.inbox_prefix = prefix
+        this.inbox_sid = sid
+
+        let buf = ByteBuffer.new()
+        buf.write("SUB ")
+        buf.write(prefix)
+        buf.write(".* ")
+        buf.write_uint_ascii(sid)
+        buf.write("\r\n")
+        this.write_raw(buf) ! {
+            this.inbox_sid = 0
+            this.inbox_prefix = ""
+            throw E
+        }
+    }
+
+    //
+    // Handshake and TLS upgrade
+    //
+
+    fn handshake() !Error {
+        let line = this.read_line() !>
+        let upper = line.length >= 4 ? line.range(0, 4).upper() : ""
+        if upper != "INFO" {
+            if line.starts_with("-ERR") || line.starts_with("-err") {
+                let err_msg = strip_err_quotes(line.range(4, line.length - 4))
+                if is_auth_error(err_msg) : throw .auth { message: err_msg }
+                throw .server { message: err_msg }
+            }
+            throw .protocol { message: "Expected INFO from NATS server, got '%{line}'" }
+        }
+        let json_part = line.range(4, line.length - 4).trim(" ")
+        this.info = parse_server_info(json_part) !>
+
+        // Upgrade to TLS before sending CONNECT when configured or required by the server
+        let tls = this.config.tls
+        if !isset(tls) && this.info.tls_required {
+            tls = TlsOptions {}
+        }
+        if isset(tls) {
+            this.upgrade_tls(tls) !>
+        }
+
+        // Send CONNECT and PING together so authentication errors surface immediately
+        let connect_cmd = encode_connect(this.config, this.tls_active)
+        let out = ByteBuffer.new()
+        out.write(connect_cmd)
+        out.write("PING\r\n")
+        this.write_raw(out) !>
+
+        // Wait for PONG (answering any server PING, accepting +OK / updated INFO, failing on -ERR)
+        while true {
+            let reply = this.read_line() !>
+            if reply.length == 0 : continue
+            let cmd = first_token(reply).upper()
+            if cmd == "PONG" : return
+            if cmd == "+OK" : continue
+            if cmd == "PING" {
+                this.write_raw("PONG\r\n") !>
+                continue
+            }
+            if cmd == "INFO" {
+                let updated = reply.range(4, reply.length - 4).trim(" ")
+                this.info = parse_server_info(updated) !>
+                continue
+            }
+            if cmd == "-ERR" {
+                let err_msg = strip_err_quotes(reply.range(4, reply.length - 4))
+                this.last_error = err_msg
+                if is_auth_error(err_msg) : throw .auth { message: err_msg }
+                throw .server { message: err_msg }
+            }
+            throw .protocol { message: "Unexpected reply during NATS handshake: '%{reply}'" }
+        }
+    }
+
+    fn upgrade_tls(tls: TlsOptions) !Error {
+        let ssl = net.Ssl.new()
+        ssl.set_verify(tls.verify)
+        let ca_file = tls.ca_file
+        if isset(ca_file) : ssl.set_ca_cert(ca_file) ! throw .tls { message: "Cannot read CA file '%{ca_file}'" }
+        let ca_dir = tls.ca_dir
+        if isset(ca_dir) : ssl.set_ca_cert_dir(ca_dir) ! throw .tls { message: "Cannot read CA directory '%{ca_dir}'" }
+        let cert = tls.certificate_file
+        if isset(cert) {
+            let key = tls.private_key_file ?? cert
+            ssl.set_certificate(cert, key, tls.key_password) ! {
+                throw .tls { message: "Cannot load client certificate '%{cert}' with key '%{key}'" }
+            }
+        }
+        let host = tls.host.length > 0 ? tls.host : this.config.host
+        ssl.set_host(host) ! throw .tls { message: "Cannot use '%{host}' as TLS server name" }
+        this.con.ssl_connect(ssl, this.config.timeout_ms) ! {
+            throw .tls { message: "TLS handshake failed: " + ssl.get_error_message() }
+        }
+        this.tls_active = true
+    }
+
+    //
+    // Background reader coroutine
+    //
+
+    fn read_loop() {
+        while !this.closed {
+            let line = this.read_line() ! {
+                this.handle_disconnect(E.message)
+                return
+            }
+            if line.length == 0 : continue
+            let cmd = first_token(line).upper()
+
+            if cmd == "MSG" {
+                let msg = this.parse_msg(line) ! {
+                    this.handle_disconnect(E.message)
+                    return
+                }
+                this.dispatch_message(msg)
+                continue
+            }
+            if cmd == "HMSG" {
+                let msg = this.parse_hmsg(line) ! {
+                    this.handle_disconnect(E.message)
+                    return
+                }
+                this.dispatch_message(msg)
+                continue
+            }
+            if cmd == "PING" {
+                this.write_raw("PONG\r\n") ! {
+                    this.handle_disconnect(E.message)
+                    return
+                }
+                continue
+            }
+            if cmd == "PONG" {
+                let waiter = this.pongs.pop_front() !? null
+                if isset(waiter) : waiter.send(true) _
+                continue
+            }
+            if cmd == "+OK" : continue
+            if cmd == "INFO" {
+                let json_part = line.range(4, line.length - 4).trim(" ")
+                let updated = parse_server_info(json_part) !? null
+                if isset(updated) : this.info = updated
+                continue
+            }
+            if cmd == "-ERR" {
+                let err_msg = strip_err_quotes(line.range(4, line.length - 4))
+                this.last_error = err_msg
+                this.pending_err = err_msg
+                continue
+            }
+        }
+    }
+
+    fn dispatch_message(msg: Message) {
+        if this.inbox_sid > 0 && msg.sid == this.inbox_sid {
+            let waiter = this.inbox_waiters.get(msg.subject) !? null
+            if isset(waiter) {
+                this.inbox_waiters.remove(msg.subject)
+                waiter.msg = msg
+                waiter.ready.send(true) _
+            }
+            return
+        }
+        let sub = this.subs.get(msg.sid) !? null
+        if !isset(sub) : return
+        let auto_unsub = sub.deliver(msg)
+        if auto_unsub : this.subs.remove(msg.sid)
+    }
+
+    fn handle_disconnect(reason: String) {
+        if this.closed : return
+        this.closed = true
+        if this.last_error.length == 0 && reason.length > 0 {
+            this.last_error = reason
+        }
+        // Finish subscriptions without dropping already-received messages
+        each this.subs as sub : sub.finish()
+        this.subs.clear()
+        this.close_waiters()
+        this.con.close() _
+    }
+
+    fn close_waiters() {
+        while true {
+            let ch = this.pongs.pop_front() ! break
+            ch.close()
+        }
+        each this.inbox_waiters as waiter {
+            waiter.ready.close()
+        }
+        this.inbox_waiters.clear()
+    }
+
+    fn throw_disconnect_error() !Error $throw {
+        if this.last_error.length > 0 {
+            if is_auth_error(this.last_error) : throw .auth { message: this.last_error }
+            throw .server { message: this.last_error }
+        }
+        throw .closed { message: "The NATS connection was closed" }
+    }
+
+    //
+    // Wire frame parsing and buffered socket I/O
+    //
+
+    fn parse_msg(line: String) Message !Error {
+        let parts = split_fields(line)
+        let subject = ""
+        let sid_str = ""
+        let reply = ""
+        let size_str = ""
+        if parts.length == 4 {
+            subject = parts.get(1) ! throw .protocol { message: "Malformed MSG header" }
+            sid_str = parts.get(2) ! throw .protocol { message: "Malformed MSG header" }
+            size_str = parts.get(3) ! throw .protocol { message: "Malformed MSG header" }
+        } else if parts.length == 5 {
+            subject = parts.get(1) ! throw .protocol { message: "Malformed MSG header" }
+            sid_str = parts.get(2) ! throw .protocol { message: "Malformed MSG header" }
+            reply = parts.get(3) ! throw .protocol { message: "Malformed MSG header" }
+            size_str = parts.get(4) ! throw .protocol { message: "Malformed MSG header" }
+        } else {
+            throw .protocol { message: "Malformed MSG line: '%{line}'" }
+        }
+        let sid = sid_str.to_uint() ! throw .protocol { message: "Invalid MSG sid '%{sid_str}'" }
+        let size = size_str.to_uint() ! throw .protocol { message: "Invalid MSG size '%{size_str}'" }
+        let payload = this.read_payload(size) !>
+        return Message {
+            subject: subject
+            reply: reply
+            payload: payload
+            sid: sid
+            client: this
+        }
+    }
+
+    fn parse_hmsg(line: String) Message !Error {
+        let parts = split_fields(line)
+        let subject = ""
+        let sid_str = ""
+        let reply = ""
+        let hdr_str = ""
+        let total_str = ""
+        if parts.length == 5 {
+            subject = parts.get(1) ! throw .protocol { message: "Malformed HMSG header" }
+            sid_str = parts.get(2) ! throw .protocol { message: "Malformed HMSG header" }
+            hdr_str = parts.get(3) ! throw .protocol { message: "Malformed HMSG header" }
+            total_str = parts.get(4) ! throw .protocol { message: "Malformed HMSG header" }
+        } else if parts.length == 6 {
+            subject = parts.get(1) ! throw .protocol { message: "Malformed HMSG header" }
+            sid_str = parts.get(2) ! throw .protocol { message: "Malformed HMSG header" }
+            reply = parts.get(3) ! throw .protocol { message: "Malformed HMSG header" }
+            hdr_str = parts.get(4) ! throw .protocol { message: "Malformed HMSG header" }
+            total_str = parts.get(5) ! throw .protocol { message: "Malformed HMSG header" }
+        } else {
+            throw .protocol { message: "Malformed HMSG line: '%{line}'" }
+        }
+        let sid = sid_str.to_uint() ! throw .protocol { message: "Invalid HMSG sid '%{sid_str}'" }
+        let hdr_size = hdr_str.to_uint() ! throw .protocol { message: "Invalid HMSG header size '%{hdr_str}'" }
+        let total_size = total_str.to_uint() ! throw .protocol { message: "Invalid HMSG total size '%{total_str}'" }
+        if hdr_size > total_size {
+            throw .protocol { message: "HMSG header size %{hdr_size} exceeds total size %{total_size}" }
+        }
+
+        let raw = this.read_payload(total_size) !>
+        let hdr_raw = raw.range(0, hdr_size)
+        let payload = raw.range(hdr_size, total_size - hdr_size)
+        let parsed = parse_headers(hdr_raw) !>
+        return Message {
+            subject: subject
+            reply: reply
+            payload: payload
+            headers: parsed.headers
+            sid: sid
+            status: parsed.status
+            client: this
+        }
+    }
+
+    fn write_raw(data: local &[u8]) !Error {
+        this.write_sem.acquire(this.config.timeout_ms) ! {
+            if error_is(E.code, timeout) : throw .timeout { message: "Timed out waiting to write to NATS socket" }
+            throw .closed { message: "The NATS client is closed" }
+        }
+        defer this.write_sem.release()
+        if this.closed : throw .closed { message: "The NATS client is closed" }
+        this.con.write(data) ! {
+            if error_is(E.code, timeout) : throw .timeout { message: "Timed out writing to NATS server" }
+            if error_is(E.code, closed) || error_is(E.code, cancelled) {
+                throw .closed { message: "The NATS connection is closed" }
+            }
+            throw .connect { message: "Failed to write bytes to NATS server" }
+        }
+    }
+
+    fn read_line() String !Error {
+        let searched: uint = 0
+        while true {
+            let buf = this.data_in
+            let start = this.read_offset
+            let found = buf.index_of('\n', start + searched) ! {
+                searched = buf.length - start
+                this.fill() !>
+                continue
+            }
+            let length = found - start
+            if length > 0 && buf.get(found - 1) == '\r' : length--
+            this.read_offset = found + 1
+            return buf.range(start, length)
+        }
+    }
+
+    fn read_payload(length: uint) String !Error {
+        this.ensure(length + 2) !>
+        let buf = this.data_in
+        let offset = this.read_offset
+        if buf.get(offset + length) != '\r' || buf.get(offset + length + 1) != '\n' {
+            throw .protocol { message: "Expected CRLF after NATS message payload" }
+        }
+        let data = buf.range(offset, length)
+        this.read_offset = offset + length + 2
+        return data
+    }
+
+    fn ensure(amount: uint) !Error {
+        while this.data_in.length - this.read_offset < amount {
+            this.fill() !>
+        }
+    }
+
+    fn fill() !Error {
+        let buf = this.data_in
+        if this.read_offset > 0 {
+            buf.clear_until(this.read_offset)
+            this.read_offset = 0
+        }
+        buf.reserve(RECV_CHUNK)
+        let spare = buf.view_spare(RECV_CHUNK)
+        let count = this.con.read(spare) ! {
+            if error_is(E.code, timeout) : throw .timeout { message: "Timed out reading from NATS server" }
+            if error_is(E.code, closed) || error_is(E.code, cancelled) {
+                throw .closed { message: "The NATS server closed the connection" }
+            }
+            throw .connect { message: "Failed to read bytes from NATS server" }
+        }
+        buf.skip(count)
+    }
+}
+
+fn first_token(line: String) String {
+    let i: uint = 0
+    while i < line.length {
+        let ch = line[i]
+        if ch == ' ' || ch == '\t' : return line.range(0, i)
+        i++
+    }
+    return line
+}
+
+fn split_fields(line: String) Array[String] {
+    let parts = Array[String]{}
+    let len = line.length
+    let i: uint = 0
+    while i < len {
+        while i < len && (line[i] == ' ' || line[i] == '\t') : i++
+        if i >= len : break
+        let start = i
+        while i < len && line[i] != ' ' && line[i] != '\t' : i++
+        parts.append(line.range(start, i - start))
+    }
+    return parts
+}

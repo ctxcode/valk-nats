@@ -1,0 +1,81 @@
+use valk.crypto
+
+/// Returns whether `subject` is a valid NATS publish subject (no spaces, empty tokens, or wildcards).
++ fn is_valid_subject(subject: String) bool {
+    return check_subject(subject, false)
+}
+
+/// Returns whether `subject` is a valid NATS subscription subject (allows `*` and trailing `>` wildcards).
++ fn is_valid_sub_subject(subject: String) bool {
+    return check_subject(subject, true)
+}
+
+/// Returns whether `queue` is a valid NATS queue group name (non-empty and free of whitespace).
++ fn is_valid_queue(queue: String) bool {
+    if queue.length == 0 : return false
+    each queue as ch {
+        if is_ws(ch) : return false
+    }
+    return true
+}
+
+/// Returns whether a NATS subscription `pattern` (supporting `*` and `>`) matches `subject`.
++ fn match_subject(pattern: String, subject: String) bool {
+    if !is_valid_sub_subject(pattern) || !is_valid_subject(subject) : return false
+    let p_tokens = pattern.split(".")
+    let s_tokens = subject.split(".")
+    let pi: uint = 0
+    while pi < p_tokens.length {
+        let p = p_tokens.get(pi) ! return false
+        if p == ">" : return pi < s_tokens.length
+        if pi >= s_tokens.length : return false
+        let s = s_tokens.get(pi) ! return false
+        if p != "*" && p != s : return false
+        pi++
+    }
+    return p_tokens.length == s_tokens.length
+}
+
+/// Returns a unique reply subject such as `_INBOX.<random>`.
++ fn new_inbox(prefix: String ("_INBOX")) String {
+    return prefix + "." + crypto.hex_encode(crypto.random_bytes(16))
+}
+
+fn check_subject(subject: String, allow_wildcards: bool) bool {
+    let len = subject.length
+    if len == 0 : return false
+    let token_start: uint = 0
+    let i: uint = 0
+    while i <= len {
+        let at_end = i == len
+        let ch: u8 = at_end ? '.' : subject[i]
+        if !at_end && is_ws(ch) : return false
+        if ch == '.' {
+            let token_len = i - token_start
+            if token_len == 0 : return false
+            if token_len == 1 {
+                let first = subject[token_start]
+                if first == '*' {
+                    if !allow_wildcards : return false
+                } else if first == '>' {
+                    if !allow_wildcards || !at_end : return false
+                }
+            } else {
+                // Wildcard characters must occupy an entire token
+                let j = token_start
+                while j < i {
+                    let tc = subject[j]
+                    if tc == '*' || tc == '>' : return false
+                    j++
+                }
+            }
+            token_start = i + 1
+        }
+        i++
+    }
+    return true
+}
+
+fn is_ws(ch: u8) bool {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'
+}

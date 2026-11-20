@@ -1,0 +1,471 @@
+use nats
+use valk.net
+use valk.json
+use valk.sync
+
+class FakeSub {
+    sid: uint
+    subject: String
+    queue: String ("")
+    max_msgs: uint (0)
+    delivered: uint (0)
+
+    fn clone() SELF {
+        return this
+    }
+}
+
+class FakeClient {
+    server: FakeServer
+    con: net.TcpConnection
+    cancel: sync.CancelToken
+    data_in: ByteBuffer (.new())
+    read_offset: uint (0)
+    subs: Array[FakeSub] (.{})
+    echo: bool (true)
+    verbose: bool (false)
+    closed: bool (false)
+
+    fn clone() SELF {
+        return this
+    }
+
+    fn send(data: local &[u8]) {
+        if this.closed : return
+        this.con.write(data) ! {
+            this.close()
+        }
+    }
+
+    fn close() {
+        if this.closed : return
+        this.closed = true
+        this.cancel.cancel()
+        this.con.close() _
+    }
+
+    fn read_line() String !Error {
+        let searched: uint = 0
+        while true {
+            let buf = this.data_in
+            let start = this.read_offset
+            let found = buf.index_of('\n', start + searched) ! {
+                searched = buf.length - start
+                this.fill() !>
+                continue
+            }
+            let length = found - start
+            if length > 0 && buf.get(found - 1) == '\r' : length--
+            this.read_offset = found + 1
+            return buf.range(start, length)
+        }
+    }
+
+    fn read_payload(length: uint) String !Error {
+        while this.data_in.length - this.read_offset < length + 2 {
+            this.fill() !>
+        }
+        let data = this.data_in.range(this.read_offset, length)
+        this.read_offset += length + 2
+        return data
+    }
+
+    fn fill() !Error {
+        let buf = this.data_in
+        if this.read_offset > 0 {
+            buf.clear_until(this.read_offset)
+            this.read_offset = 0
+        }
+        buf.reserve(16384)
+        let spare = buf.view_spare(16384)
+        let count = this.con.read(spare) ! throw .closed
+        buf.skip(count)
+    }
+
+    fn run() {
+        defer {
+            this.close()
+            this.server.remove_client(this)
+        }
+
+        // 1. Send initial INFO
+        this.send(this.server.info_line())
+
+        // 1b. Optional TLS upgrade right after INFO (NATS protocol order)
+        let tls_ctx = this.server.tls_context
+        if isset(tls_ctx) {
+            this.con.ssl_accept(tls_ctx, 5000) ! return
+        }
+
+        // 2. Process client commands
+        while !this.closed && !this.server.stopped {
+            let line = this.read_line() ! return
+            if line.length == 0 : continue
+            let parts = fake_split(line)
+            if parts.length == 0 : continue
+            let cmd = (parts.get(0) ! continue).upper()
+
+            if cmd == "CONNECT" {
+                let json_str = line.range(7, line.length - 7).trim(" ")
+                this.server.last_connect_json = json_str
+                let doc = json.decode(json_str) ! {
+                    this.send("-ERR 'Invalid CONNECT JSON'\r\n")
+                    return
+                }
+                if doc["verbose"].is_bool : this.verbose = doc["verbose"].bool
+                if doc["echo"].is_bool : this.echo = doc["echo"].bool
+
+                let ok = this.server.check_auth(doc)
+                if !ok {
+                    this.send("-ERR 'Authorization Violation'\r\n")
+                    return
+                }
+                if this.verbose : this.send("+OK\r\n")
+                if this.server.send_ping_on_connect {
+                    this.send("PING\r\n")
+                }
+                continue
+            }
+
+            if cmd == "PING" {
+                this.server.pings_received++
+                if !this.server.drop_pongs : this.send("PONG\r\n")
+                continue
+            }
+
+            if cmd == "PONG" {
+                this.server.pongs_received++
+                continue
+            }
+
+            if cmd == "SUB" {
+                let subject = parts.get(1) ! continue
+                let queue = ""
+                let sid_str = ""
+                if parts.length == 3 {
+                    sid_str = parts.get(2) ! continue
+                } else if parts.length == 4 {
+                    queue = parts.get(2) ! continue
+                    sid_str = parts.get(3) ! continue
+                } else {
+                    this.send("-ERR 'Unknown Protocol Operation'\r\n")
+                    continue
+                }
+                let sid = sid_str.to_uint() ! continue
+                this.subs.append(FakeSub {
+                    sid: sid
+                    subject: subject
+                    queue: queue
+                })
+                if this.verbose : this.send("+OK\r\n")
+                continue
+            }
+
+            if cmd == "UNSUB" {
+                let sid_str = parts.get(1) ! continue
+                let sid = sid_str.to_uint() ! continue
+                let max_msgs: uint = 0
+                if parts.length >= 3 {
+                    let max_str = parts.get(2) ! continue
+                    max_msgs = max_str.to_uint() ! continue
+                }
+                this.handle_unsub(sid, max_msgs)
+                if this.verbose : this.send("+OK\r\n")
+                continue
+            }
+
+            if cmd == "PUB" {
+                let subject = parts.get(1) ! continue
+                let reply = ""
+                let size_str = ""
+                if parts.length == 3 {
+                    size_str = parts.get(2) ! continue
+                } else if parts.length == 4 {
+                    reply = parts.get(2) ! continue
+                    size_str = parts.get(3) ! continue
+                } else {
+                    this.send("-ERR 'Unknown Protocol Operation'\r\n")
+                    continue
+                }
+                let size = size_str.to_uint() ! continue
+                let payload = this.read_payload(size) ! return
+                if this.server.reject_subject.length > 0 && subject == this.server.reject_subject {
+                    this.send("-ERR 'Permissions Violation for Publish to \"" + subject + "\"'\r\n")
+                    continue
+                }
+                if this.verbose : this.send("+OK\r\n")
+                this.server.route_pub(this, subject, reply, "", payload)
+                continue
+            }
+
+            if cmd == "HPUB" {
+                let subject = parts.get(1) ! continue
+                let reply = ""
+                let hdr_str = ""
+                let total_str = ""
+                if parts.length == 4 {
+                    hdr_str = parts.get(2) ! continue
+                    total_str = parts.get(3) ! continue
+                } else if parts.length == 5 {
+                    reply = parts.get(2) ! continue
+                    hdr_str = parts.get(3) ! continue
+                    total_str = parts.get(4) ! continue
+                } else {
+                    this.send("-ERR 'Unknown Protocol Operation'\r\n")
+                    continue
+                }
+                let hdr_size = hdr_str.to_uint() ! continue
+                let total_size = total_str.to_uint() ! continue
+                let raw = this.read_payload(total_size) ! return
+                let hdr_raw = raw.range(0, hdr_size)
+                let payload = raw.range(hdr_size, total_size - hdr_size)
+                if this.verbose : this.send("+OK\r\n")
+                this.server.route_pub(this, subject, reply, hdr_raw, payload)
+                continue
+            }
+        }
+    }
+
+    fn handle_unsub(sid: uint, max_msgs: uint) {
+        let i: uint = 0
+        while i < this.subs.length {
+            let sub = this.subs.get(i) ! break
+            if sub.sid == sid {
+                if max_msgs == 0 || sub.delivered >= max_msgs {
+                    this.subs.remove(i)
+                } else {
+                    sub.max_msgs = max_msgs
+                }
+                return
+            }
+            i++
+        }
+    }
+
+    fn remove_sub(sid: uint) {
+        let i: uint = 0
+        while i < this.subs.length {
+            let sub = this.subs.get(i) ! break
+            if sub.sid == sid {
+                this.subs.remove(i)
+                return
+            }
+            i++
+        }
+    }
+}
+
+class FakeServer {
+    listener: atomic net.TcpServer
+    port: u16
+    stopped: bool (false)
+    clients: Array[FakeClient] (.{})
+    queue_rr: Map[uint] (.{})
+
+    // Configurable server behavior
+    server_id: String ("FAKE-NATS-1")
+    version: String ("2.10.0")
+    max_payload: uint (1048576)
+    headers: bool (true)
+    nonce: String ("test-nonce-123")
+    connect_urls: Array[String] (.{})
+    required_user: String ("")
+    required_pass: String ("")
+    required_token: String ("")
+    send_ping_on_connect: bool (false)
+    drop_pongs: bool (false)
+    reject_subject: String ("")
+    tls_required: bool (false)
+    tls_context: ?atomic net.SslServerContext (null)
+
+    // Observed stats
+    pings_received: uint (0)
+    pongs_received: uint (0)
+    last_connect_json: String ("")
+
+    static fn start() FakeServer {
+        let listener = net.tcp_server("127.0.0.1", 0) ! panic("Failed to bind fake NATS server")
+        let addr = listener.local_address() ! panic("Failed to read fake NATS server address")
+        let srv = FakeServer {
+            listener: listener
+            port: addr.port
+            connect_urls: .{ "127.0.0.1:" + addr.port }
+        }
+        co srv.accept_loop()
+        return srv
+    }
+
+    fn url() String {
+        return "nats://127.0.0.1:" + this.port
+    }
+
+    fn info_line() String {
+        let urls = ByteBuffer.new()
+        urls.write_byte('[')
+        each this.connect_urls as u, idx {
+            if idx > 0 : urls.write_byte(',')
+            urls.write_byte('"')
+            urls.write(u)
+            urls.write_byte('"')
+        }
+        urls.write_byte(']')
+        let hdr_str = this.headers ? "true" : "false"
+        let tls_str = this.tls_required ? "true" : "false"
+        return "INFO {\"server_id\":\"" + this.server_id +
+            "\",\"server_name\":\"fake-nats\",\"version\":\"" + this.version +
+            "\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":" + this.port +
+            ",\"max_payload\":" + this.max_payload +
+            ",\"headers\":" + hdr_str +
+            ",\"tls_required\":" + tls_str +
+            ",\"nonce\":\"" + this.nonce +
+            "\",\"connect_urls\":" + urls.into_string() + "}\r\n"
+    }
+
+    fn check_auth(doc: json.Value) bool {
+        if this.required_token.length > 0 {
+            return doc["auth_token"].string == this.required_token
+        }
+        if this.required_user.length > 0 || this.required_pass.length > 0 {
+            return doc["user"].string == this.required_user && doc["pass"].string == this.required_pass
+        }
+        return true
+    }
+
+    fn accept_loop() {
+        while !this.stopped {
+            let con = this.listener.accept() ! return
+            if this.stopped {
+                con.close() _
+                return
+            }
+            con.set_timeouts(0, 5000)
+            let cancel = sync.CancelToken.new() ! {
+                con.close() _
+                continue
+            }
+            con.set_cancel(cancel)
+            let fc = FakeClient {
+                server: this
+                con: con
+                cancel: cancel
+            }
+            this.clients.append(fc)
+            co fc.run()
+        }
+    }
+
+    fn remove_client(fc: FakeClient) {
+        this.clients.remove_value(fc)
+    }
+
+    fn route_pub(sender: FakeClient, subject: String, reply: String, hdr_raw: String, payload: String) {
+        // Group matching queue subscriptions by queue name, deliver non-queue immediately
+        let queue_clients = Map[Array[FakeClient]]{}
+        let queue_subs = Map[Array[FakeSub]]{}
+
+        let clients_snapshot = this.clients.clone()
+        each clients_snapshot as client {
+            if client.closed : continue
+            if client == sender && !client.echo : continue
+            let subs_snapshot = client.subs.clone()
+            each subs_snapshot as sub {
+                if !nats.match_subject(sub.subject, subject) : continue
+                if sub.queue.length == 0 {
+                    this.deliver_to(client, sub, subject, reply, hdr_raw, payload)
+                } else {
+                    let clist = queue_clients.get(sub.queue) !? <{
+                        let arr = Array[FakeClient]{}
+                        queue_clients.set(sub.queue, arr)
+                        return arr
+                    }
+                    let slist = queue_subs.get(sub.queue) !? <{
+                        let arr = Array[FakeSub]{}
+                        queue_subs.set(sub.queue, arr)
+                        return arr
+                    }
+                    clist.append(client)
+                    slist.append(sub)
+                }
+            }
+        }
+
+        // Round-robin deliver one copy per queue group
+        each queue_clients as clist, qname {
+            let slist = queue_subs.get(qname) ! continue
+            if clist.length == 0 : continue
+            let counter = this.queue_rr.get(qname) !? 0
+            let idx = counter % clist.length
+            this.queue_rr.set(qname, counter + 1)
+            let target_client = clist.get(idx) ! continue
+            let target_sub = slist.get(idx) ! continue
+            this.deliver_to(target_client, target_sub, subject, reply, hdr_raw, payload)
+        }
+    }
+
+    fn deliver_to(client: FakeClient, sub: FakeSub, subject: String, reply: String, hdr_raw: String, payload: String) {
+        let out = ByteBuffer.new()
+        if hdr_raw.length > 0 {
+            let total = hdr_raw.length + payload.length
+            out.write("HMSG ")
+            out.write(subject)
+            out.write_byte(' ')
+            out.write_uint_ascii(sub.sid)
+            out.write_byte(' ')
+            if reply.length > 0 {
+                out.write(reply)
+                out.write_byte(' ')
+            }
+            out.write_uint_ascii(hdr_raw.length)
+            out.write_byte(' ')
+            out.write_uint_ascii(total)
+            out.write("\r\n")
+            out.write(hdr_raw)
+            out.write(payload)
+            out.write("\r\n")
+        } else {
+            out.write("MSG ")
+            out.write(subject)
+            out.write_byte(' ')
+            out.write_uint_ascii(sub.sid)
+            out.write_byte(' ')
+            if reply.length > 0 {
+                out.write(reply)
+                out.write_byte(' ')
+            }
+            out.write_uint_ascii(payload.length)
+            out.write("\r\n")
+            out.write(payload)
+            out.write("\r\n")
+        }
+        client.send(out)
+        sub.delivered++
+        if sub.max_msgs > 0 && sub.delivered >= sub.max_msgs {
+            client.remove_sub(sub.sid)
+        }
+    }
+
+    fn stop() {
+        if this.stopped : return
+        this.stopped = true
+        this.listener.close() _
+        let clients_snapshot = this.clients.clone()
+        each clients_snapshot as c : c.close()
+        this.clients.clear()
+    }
+}
+
+error Error (closed)
+
+fn fake_split(line: String) Array[String] {
+    let parts = Array[String]{}
+    let len = line.length
+    let i: uint = 0
+    while i < len {
+        while i < len && (line[i] == ' ' || line[i] == '\t') : i++
+        if i >= len : break
+        let start = i
+        while i < len && line[i] != ' ' && line[i] != '\t' : i++
+        parts.append(line.range(start, i - start))
+    }
+    return parts
+}

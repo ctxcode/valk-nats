@@ -1,0 +1,122 @@
+use nats
+
+test "Subject validation" {
+    assert(nats.is_valid_subject("foo"))
+    assert(nats.is_valid_subject("foo.bar.baz"))
+    assert(nats.is_valid_subject("_INBOX.abc123"))
+    assert(nats.is_valid_subject("orders.us-east.v2"))
+
+    // Rejects empty, whitespace, empty tokens, and wildcards for publish subjects
+    assert(!nats.is_valid_subject(""))
+    assert(!nats.is_valid_subject("foo bar"))
+    assert(!nats.is_valid_subject("foo\tbar"))
+    assert(!nats.is_valid_subject("foo\r\nbar"))
+    assert(!nats.is_valid_subject(".foo"))
+    assert(!nats.is_valid_subject("foo."))
+    assert(!nats.is_valid_subject("foo..bar"))
+    assert(!nats.is_valid_subject("foo.*"))
+    assert(!nats.is_valid_subject("foo.>"))
+    assert(!nats.is_valid_subject("foo.bar*"))
+
+    // Subscription subjects allow * anywhere and > as final token
+    assert(nats.is_valid_sub_subject("foo"))
+    assert(nats.is_valid_sub_subject("foo.*"))
+    assert(nats.is_valid_sub_subject("*.bar.*"))
+    assert(nats.is_valid_sub_subject("foo.>"))
+    assert(nats.is_valid_sub_subject(">"))
+    assert(nats.is_valid_sub_subject("*"))
+
+    // Subscription subjects still reject bad tokens and misplaced/partial wildcards
+    assert(!nats.is_valid_sub_subject(""))
+    assert(!nats.is_valid_sub_subject("foo..bar"))
+    assert(!nats.is_valid_sub_subject("foo.>.bar"))
+    assert(!nats.is_valid_sub_subject("foo.bar*"))
+    assert(!nats.is_valid_sub_subject("foo.bar>"))
+    assert(!nats.is_valid_sub_subject("foo bar"))
+
+    // Queue group validation
+    assert(nats.is_valid_queue("workers"))
+    assert(nats.is_valid_queue("worker-group.1"))
+    assert(!nats.is_valid_queue(""))
+    assert(!nats.is_valid_queue("bad queue"))
+    assert(!nats.is_valid_queue("bad\tqueue"))
+}
+
+test "Subject wildcard matching" {
+    // Exact match
+    assert(nats.match_subject("foo.bar", "foo.bar"))
+    assert(!nats.match_subject("foo.bar", "foo.baz"))
+    assert(!nats.match_subject("foo.bar", "foo.bar.baz"))
+
+    // Single-token wildcard *
+    assert(nats.match_subject("foo.*", "foo.bar"))
+    assert(!nats.match_subject("foo.*", "foo"))
+    assert(!nats.match_subject("foo.*", "foo.bar.baz"))
+    assert(nats.match_subject("*.bar.*", "a.bar.c"))
+    assert(!nats.match_subject("*.bar.*", "a.baz.c"))
+
+    // Multi-token wildcard >
+    assert(nats.match_subject("foo.>", "foo.bar"))
+    assert(nats.match_subject("foo.>", "foo.bar.baz"))
+    assert(nats.match_subject("foo.>", "foo.a.b.c.d"))
+    assert(!nats.match_subject("foo.>", "foo"))
+    assert(nats.match_subject(">", "foo"))
+    assert(nats.match_subject(">", "foo.bar.baz"))
+
+    // Invalid patterns or subjects never match
+    assert(!nats.match_subject("foo.>.bar", "foo.a.bar"))
+    assert(!nats.match_subject("foo..bar", "foo..bar"))
+    assert(!nats.match_subject("foo.*", "foo.*"))
+}
+
+test "Inbox generation" {
+    let a = nats.new_inbox()
+    let b = nats.new_inbox()
+    assert(a.starts_with("_INBOX."))
+    assert(b.starts_with("_INBOX."))
+    assert(a != b)
+    assert(nats.is_valid_subject(a))
+    assert(nats.is_valid_subject(b))
+
+    let custom = nats.new_inbox("_CUSTOM")
+    assert(custom.starts_with("_CUSTOM."))
+    assert(nats.is_valid_subject(custom))
+}
+
+test "Config from URL" {
+    let c1 = nats.config_from_url("nats://127.0.0.1:4222") ! { assert(false) return }
+    assert(c1.host == "127.0.0.1")
+    assert(c1.port == 4222)
+    assert(c1.user == "")
+    assert(c1.pass == "")
+    assert(c1.auth_token == "")
+    assert(!isset(c1.tls))
+
+    let c2 = nats.config_from_url("tls://alice:s3cr3t@nats.example.com:4443", 3000) ! { assert(false) return }
+    assert(c2.host == "nats.example.com")
+    assert(c2.port == 4443)
+    assert(c2.user == "alice")
+    assert(c2.pass == "s3cr3t")
+    assert(c2.auth_token == "")
+    assert(c2.timeout_ms == 3000)
+    assert(isset(c2.tls))
+
+    let c3 = nats.config_from_url("nats://my-secret-token@10.0.0.5") ! { assert(false) return }
+    assert(c3.host == "10.0.0.5")
+    assert(c3.port == 4222)
+    assert(c3.user == "")
+    assert(c3.pass == "")
+    assert(c3.auth_token == "my-secret-token")
+
+    // Bare host:port defaults to nats://
+    let c4 = nats.config_from_url("127.0.0.1:5222") ! { assert(false) return }
+    assert(c4.host == "127.0.0.1")
+    assert(c4.port == 5222)
+
+    // Invalid scheme rejected
+    let failed = false
+    nats.config_from_url("http://127.0.0.1:4222") ! {
+        failed = error_is(E.code, connect)
+    }
+    assert(failed)
+}

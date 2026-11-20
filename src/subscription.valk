@@ -1,0 +1,122 @@
+use valk.sync
+
+/// An active NATS subscription backed by a coroutine-friendly channel.
+///
+/// Call `next` to receive incoming messages, `unsubscribe` to stop receiving (optionally after
+/// `max_msgs` messages), or `drain` to process in-flight messages before closing.
++ class Subscription {
+    /// The subject pattern this subscription listens on.
+    + subject: String
+    /// Optional queue group name; empty for a normal subscription.
+    + queue: String ("")
+    /// Server-assigned numeric subscription ID.
+    + sid: uint
+    /// True once the subscription is closed or drained.
+    ~ closed: bool (false)
+    /// Number of messages delivered to this subscription so far.
+    ~ received: uint (0)
+    /// Auto-unsubscribe limit set by `unsubscribe(max_msgs)`, or 0 when unlimited.
+    ~ max_msgs: uint (0)
+    dropped: bool (false)
+    client: Client
+    messages: Deque[Message] (.{})
+    ready: sync.Channel[bool]
+
+    /// Waits for and returns the next message on this subscription.
+    ///
+    /// `timeout_ms` 0 waits forever. Throws `timeout` when `timeout_ms` passes without a message,
+    /// and `closed` once the subscription is unsubscribed/closed and all buffered messages have
+    /// been read.
+    + fn next(timeout_ms: uint (0)) Message !Error {
+        if this.dropped {
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+        this.ready.recv(timeout_ms) ! {
+            if error_is(E.code, timeout) {
+                throw .timeout { message: "Timed out waiting for message on '%{this.subject}'" }
+            }
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+        if this.dropped {
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+        return this.messages.pop_front() ! {
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+    }
+
+    /// Returns the next buffered message without waiting, or null when none is queued yet.
+    ///
+    /// Throws `closed` once the subscription is closed and empty.
+    + fn try_next() ?Message !Error {
+        if this.dropped {
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+        this.ready.try_recv() ! {
+            if error_is(E.code, empty) : return null
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+        if this.dropped {
+            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+        }
+        return this.messages.pop_front() !? null
+    }
+
+    /// Returns how many messages are currently buffered and ready for `next`.
+    + fn pending() uint {
+        return this.messages.length
+    }
+
+    /// Unsubscribes from the subject.
+    ///
+    /// When `max_msgs` is 0, unsubscribes immediately and discards buffered messages. When
+    /// `max_msgs` is greater than 0, tells the server to auto-unsubscribe after `max_msgs`
+    /// total messages have been received.
+    + fn unsubscribe(max_msgs: uint (0)) !Error {
+        this.client.unsubscribe_sub(this, max_msgs) !>
+    }
+
+    /// Unsubscribes on the server, flushes in-flight messages into this subscription's queue,
+    /// and closes it cleanly so remaining buffered messages can still be read with `next`.
+    + fn drain(timeout_ms: uint (5000)) !Error {
+        this.client.drain_sub(this, timeout_ms) !>
+    }
+
+    // Sets an auto-unsubscribe limit; returns true if the limit was already reached.
+    fn set_max_msgs(max: uint) bool {
+        this.max_msgs = max
+        if this.received >= max {
+            this.finish()
+            return true
+        }
+        return false
+    }
+
+    // Delivers a message from the reader coroutine. Returns true if auto-unsubscribed.
+    fn deliver(msg: Message) bool {
+        if this.closed || this.dropped : return false
+        this.received++
+        this.messages.push_back(msg)
+        this.ready.send(true) _
+        if this.max_msgs > 0 && this.received >= this.max_msgs {
+            this.finish()
+            return true
+        }
+        return false
+    }
+
+    // Closes without discarding already-buffered messages (used by drain and max_msgs).
+    fn finish() {
+        if this.closed : return
+        this.closed = true
+        this.ready.close()
+    }
+
+    // Closes immediately and discards buffered messages (used by immediate unsubscribe/close).
+    fn close_immediate() {
+        this.dropped = true
+        this.closed = true
+        this.messages.clear()
+        this.ready.close()
+    }
+}

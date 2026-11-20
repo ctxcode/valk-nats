@@ -1,0 +1,155 @@
+use valk.json
+
+value CLIENT_LANG ("valk")
+value CLIENT_VERSION ("0.1.0")
+value HEADER_VERSION ("NATS/1.0")
+
+/// Server metadata received in the NATS `INFO` message.
++ class ServerInfo {
+    /// Unique identifier of the server.
+    + server_id: String ("")
+    /// Human-readable server name.
+    + server_name: String ("")
+    /// Server software version.
+    + version: String ("")
+    /// Protocol version advertised by the server.
+    + proto: int (0)
+    /// Host reported by the server.
+    + host: String ("")
+    /// Port reported by the server.
+    + port: u32 (0)
+    /// Maximum payload size in bytes accepted by the server.
+    + max_payload: uint (1048576)
+    /// Whether the server supports NATS headers (`HPUB`/`HMSG`).
+    + headers: bool (false)
+    /// Whether the server requires a TLS upgrade before `CONNECT`.
+    + tls_required: bool (false)
+    /// Whether the server requests a client certificate during TLS.
+    + tls_verify: bool (false)
+    /// Whether TLS is available on the server.
+    + tls_available: bool (false)
+    /// Random challenge nonce for NKey/JWT auth, when enabled.
+    + nonce: String ("")
+    /// Additional cluster server URLs advertised by the server.
+    + connect_urls: Array[String] (.{})
+    /// Client ID assigned by the server.
+    + client_id: uint (0)
+    /// Whether JetStream is enabled on the server.
+    + jetstream: bool (false)
+}
+
+class ConnectOptions {
+    verbose: bool (false)
+    pedantic: bool (false)
+    tls_required: bool (false)
+    auth_token: String ("") `omitempty`
+    user: String ("") `omitempty`
+    pass: String ("") `omitempty`
+    name: String ("") `omitempty`
+    lang: String (CLIENT_LANG)
+    version: String (CLIENT_VERSION)
+    protocol: uint (1)
+    echo: bool (true)
+    headers: bool (true)
+}
+
+class ParsedHeaders {
+    headers: Map[String] (.{})
+    status: String ("")
+}
+
+fn parse_server_info(json_text: String) ServerInfo !Error {
+    return json.decode_to[ServerInfo](json_text) ! {
+        throw .protocol { message: "Invalid INFO payload from server: %{E.message}" }
+    }
+}
+
+fn encode_connect(config: Config, tls_active: bool) String {
+    let opts = ConnectOptions {
+        verbose: config.verbose
+        pedantic: config.pedantic
+        tls_required: tls_active
+        auth_token: config.auth_token
+        user: config.user
+        pass: config.pass
+        name: config.name
+        lang: CLIENT_LANG
+        version: CLIENT_VERSION
+        protocol: 1
+        echo: config.echo
+        headers: config.headers
+    }
+    return "CONNECT " + json.encode(opts) + "\r\n"
+}
+
+/// Encodes NATS/1.0 headers into their wire representation (`NATS/1.0\r\nKey: Value\r\n\r\n`).
+fn encode_headers(headers: Map[String]) String !Error {
+    let out = ByteBuffer.new()
+    out.write(HEADER_VERSION)
+    out.write("\r\n")
+    each headers as val, key {
+        if key.length == 0 || has_crlf(key) || key.contains(":") {
+            throw .protocol { message: "Invalid NATS header key '%{key}'" }
+        }
+        if has_crlf(val) {
+            throw .protocol { message: "Invalid NATS header value for '%{key}'" }
+        }
+        out.write(key)
+        out.write(": ")
+        out.write(val)
+        out.write("\r\n")
+    }
+    out.write("\r\n")
+    return out.into_string()
+}
+
+/// Parses a NATS/1.0 header block into a map of headers and an optional status code.
+fn parse_headers(raw: String) ParsedHeaders !Error {
+    let result = ParsedHeaders {}
+    if raw.length == 0 : return result
+
+    let lines = raw.split("\r\n")
+    let first = lines.get(0) ! throw .protocol { message: "Empty NATS header block" }
+    if !first.starts_with(HEADER_VERSION) {
+        throw .protocol { message: "Unexpected NATS header version line: '%{first}'" }
+    }
+    if first.length > HEADER_VERSION.length {
+        let rest = first.range(HEADER_VERSION.length, first.length - HEADER_VERSION.length).trim(" ")
+        if rest.length > 0 {
+            let space = rest.index_of_byte(' ') !? rest.length
+            result.status = rest.range(0, space)
+        }
+    }
+
+    let i: uint = 1
+    while i < lines.length {
+        let line = lines.get(i) ! break
+        i++
+        if line.length == 0 : continue
+        let colon = line.index_of_byte(':') ! continue
+        let key = line.range(0, colon).trim(" ")
+        let val = line.range(colon + 1, line.length - colon - 1).trim(" ")
+        if key.length > 0 : result.headers.set(key, val)
+    }
+    return result
+}
+
+fn strip_err_quotes(text: String) String {
+    let trimmed = text.trim(" ")
+    if trimmed.length >= 2 && trimmed[0] == '\'' && trimmed[trimmed.length - 1] == '\'' {
+        return trimmed.range(1, trimmed.length - 2)
+    }
+    return trimmed
+}
+
+fn is_auth_error(text: String) bool {
+    let lower = text.lower()
+    return lower.contains("authorization") || lower.contains("authentication") || lower.contains("user")
+}
+
+fn has_crlf(text: String) bool {
+    each text as ch {
+        if ch == '\r' || ch == '\n' : return true
+    }
+    return false
+}

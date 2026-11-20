@@ -1,0 +1,538 @@
+use nats
+use valk.json
+use valk.net
+use valk.time
+
+test "Handshake INFO and CONNECT options" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+    srv.server_id = "SRV-ALPHA"
+    srv.version = "2.10.4"
+    srv.max_payload = 65536
+    srv.nonce = "nonce-xyz"
+
+    let client = nats.Client.connect_with(nats.Config {
+        host: "127.0.0.1"
+        port: srv.port.to(u32)
+        name: "valk-test-client"
+        verbose: true
+        pedantic: true
+        echo: true
+        headers: true
+    }) ! { println(E.message) assert(false) return }
+    defer client.close()
+
+    assert(client.info.server_id == "SRV-ALPHA")
+    assert(client.info.version == "2.10.4")
+    assert(client.info.max_payload == 65536)
+    assert(client.info.headers)
+    assert(client.info.nonce == "nonce-xyz")
+    assert(client.info.connect_urls.length == 1)
+
+    let connect_doc = json.decode(srv.last_connect_json) ! { assert(false) return }
+    assert(connect_doc["name"].string == "valk-test-client")
+    assert(connect_doc["lang"].string == "valk")
+    assert(connect_doc["verbose"].bool == true)
+    assert(connect_doc["pedantic"].bool == true)
+    assert(connect_doc["headers"].bool == true)
+    assert(connect_doc["echo"].bool == true)
+}
+
+test "Auth user/pass success and failure" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+    srv.required_user = "alice"
+    srv.required_pass = "secret123"
+
+    // Valid credentials via URL
+    let url = "nats://alice:secret123@127.0.0.1:" + srv.port
+    let client = nats.Client.connect(url) ! { println(E.message) assert(false) return }
+    client.flush() ! { println(E.message) assert(false) return }
+    client.close()
+
+    // Wrong password fails with .auth
+    let auth_failed = false
+    nats.Client.connect("nats://alice:wrong@127.0.0.1:" + srv.port) ! {
+        auth_failed = error_is(E.code, auth)
+    }
+    assert(auth_failed)
+}
+
+test "Auth token success and failure" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+    srv.required_token = "tok-super-secret"
+
+    // Valid token via URL
+    let client = nats.Client.connect("nats://tok-super-secret@127.0.0.1:" + srv.port) ! { println(E.message) assert(false) return }
+    client.flush() ! { println(E.message) assert(false) return }
+    client.close()
+
+    // Invalid token fails with .auth
+    let auth_failed = false
+    nats.Client.connect_with(nats.Config {
+        host: "127.0.0.1"
+        port: srv.port.to(u32)
+        auth_token: "bad-token"
+    }) ! {
+        auth_failed = error_is(E.code, auth)
+    }
+    assert(auth_failed)
+}
+
+test "Publish and subscribe exact, wildcards, and binary payloads" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let sub_client = nats.Client.connect(srv.url()) ! { println(E.message) assert(false) return }
+    defer sub_client.close()
+    let pub_client = nats.Client.connect(srv.url()) ! { println(E.message) assert(false) return }
+    defer pub_client.close()
+
+    let exact = sub_client.subscribe("events.login") ! { println(E.message) assert(false) return }
+    let star = sub_client.subscribe("events.*") ! { println(E.message) assert(false) return }
+    let gt = sub_client.subscribe("events.>") ! { println(E.message) assert(false) return }
+    sub_client.flush() ! { println(E.message) assert(false) return }
+
+    // Publish exact match
+    pub_client.publish("events.login", "user=ada") ! { println(E.message) assert(false) return }
+    // Publish deeper subject (matches > only, not * or exact)
+    pub_client.publish("events.audit.created", "id=42") ! { println(E.message) assert(false) return }
+    // Binary payload containing \r\n and null bytes
+    let binary = "line1\r\nline2\x00end\r\n"
+    pub_client.publish("events.login", binary) ! { println(E.message) assert(false) return }
+    // Empty payload
+    pub_client.publish("events.login", "") ! { println(E.message) assert(false) return }
+    pub_client.flush() ! { println(E.message) assert(false) return }
+
+    let m1 = exact.next(2000) ! { println(E.message) assert(false) return }
+    assert(m1.subject == "events.login")
+    assert(m1.payload == "user=ada")
+
+    let m2 = exact.next(2000) ! { println(E.message) assert(false) return }
+    assert(m2.payload == binary)
+
+    let m3 = exact.next(2000) ! { println(E.message) assert(false) return }
+    assert(m3.payload == "")
+
+    // star received the 3 events.login messages (not events.audit.created)
+    assert((star.next(2000) ! { assert(false) return }).payload == "user=ada")
+    assert((star.next(2000) ! { assert(false) return }).payload == binary)
+    assert((star.next(2000) ! { assert(false) return }).payload == "")
+    let star_timed_out = false
+    star.next(100) ! { star_timed_out = error_is(E.code, timeout) }
+    assert(star_timed_out)
+
+    // gt received all 4 messages in order
+    assert((gt.next(2000) ! { assert(false) return }).subject == "events.login")
+    let deep = gt.next(2000) ! { assert(false) return }
+    assert(deep.subject == "events.audit.created")
+    assert(deep.payload == "id=42")
+    assert((gt.next(2000) ! { assert(false) return }).payload == binary)
+    assert((gt.next(2000) ! { assert(false) return }).payload == "")
+}
+
+test "Invalid subjects and max_payload checks" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+    srv.max_payload = 16
+
+    let client = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer client.close()
+
+    let bad_pub = false
+    client.publish("bad subject", "x") ! { bad_pub = error_is(E.code, invalid_subject) }
+    assert(bad_pub)
+
+    let wildcard_pub = false
+    client.publish("foo.*", "x") ! { wildcard_pub = error_is(E.code, invalid_subject) }
+    assert(wildcard_pub)
+
+    let bad_sub = false
+    client.subscribe("foo..bar") ! { bad_sub = error_is(E.code, invalid_subject) }
+    assert(bad_sub)
+
+    let bad_queue = false
+    client.subscribe("foo.bar", "bad queue") ! { bad_queue = error_is(E.code, invalid_subject) }
+    assert(bad_queue)
+
+    let too_big = false
+    client.publish("foo.bar", "01234567890123456789") ! { too_big = error_is(E.code, protocol) }
+    assert(too_big)
+}
+
+test "Queue group subscriptions" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let c1 = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer c1.close()
+    let c2 = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer c2.close()
+    let pub_c = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer pub_c.close()
+
+    let q1 = c1.subscribe("jobs.work", "workers") ! { assert(false) return }
+    let q2 = c2.subscribe("jobs.work", "workers") ! { assert(false) return }
+    let fanout = c1.subscribe("jobs.work") ! { assert(false) return }
+    c1.flush() ! { assert(false) return }
+    c2.flush() ! { assert(false) return }
+
+    let total: uint = 10
+    let i: uint = 0
+    while i < total {
+        pub_c.publish("jobs.work", "task-" + i) ! { assert(false) return }
+        i++
+    }
+    pub_c.flush() ! { assert(false) return }
+    c1.flush() ! { assert(false) return }
+    c2.flush() ! { assert(false) return }
+
+    let seen_q1: uint = 0
+    let seen_q2: uint = 0
+    while true {
+        let m = q1.try_next() ! break
+        if !isset(m) : break
+        seen_q1++
+    }
+    while true {
+        let m = q2.try_next() ! break
+        if !isset(m) : break
+        seen_q2++
+    }
+    assert(seen_q1 == 5)
+    assert(seen_q2 == 5)
+    assert(seen_q1 + seen_q2 == total)
+
+    // Non-queue subscriber still received all 10 messages
+    let seen_fanout: uint = 0
+    while seen_fanout < total {
+        fanout.next(2000) ! { assert(false) return }
+        seen_fanout++
+    }
+    assert(seen_fanout == total)
+}
+
+test "HPUB and HMSG headers round-trip" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let client = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer client.close()
+
+    let sub = client.subscribe("orders.created") ! { assert(false) return }
+    client.flush() ! { assert(false) return }
+
+    let hdrs = Map[String]{
+        "X-Trace-Id" => "trace-9988"
+        "Content-Type" => "application/json"
+    }
+    client.publish("orders.created", "{\"id\":7}", "orders.ack", hdrs) ! { println(E.message) assert(false) return }
+    client.publish("orders.created", "", "", .{ "X-Empty-Body" => "yes" }) ! { println(E.message) assert(false) return }
+
+    let m1 = sub.next(2000) ! { println(E.message) assert(false) return }
+    assert(m1.subject == "orders.created")
+    assert(m1.reply == "orders.ack")
+    assert(m1.payload == "{\"id\":7}")
+    assert((m1.header("X-Trace-Id") ?? "") == "trace-9988")
+    assert((m1.header("Content-Type") ?? "") == "application/json")
+    assert(!isset(m1.header("X-Missing")))
+
+    let m2 = sub.next(2000) ! { println(E.message) assert(false) return }
+    assert(m2.payload == "")
+    assert((m2.header("X-Empty-Body") ?? "") == "yes")
+
+    // Invalid header key with CRLF rejected
+    let bad_hdr = false
+    client.publish("orders.created", "x", "", .{ "Bad\r\nKey" => "v" }) ! {
+        bad_hdr = error_is(E.code, protocol)
+    }
+    assert(bad_hdr)
+}
+
+test "Request and respond success, headers, and timeout" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let responder = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer responder.close()
+    let requester = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer requester.close()
+
+    let sub = responder.subscribe("math.double") ! { assert(false) return }
+    responder.flush() ! { assert(false) return }
+
+    // Background service handler
+    let worker = co serve_double(sub)
+
+    let r1 = requester.request("math.double", "21", 2000) ! { println(E.message) assert(false) return }
+    assert(r1.payload == "42")
+
+    let r2 = requester.request("math.double", "100", 2000, .{ "X-Req" => "abc" }) ! { println(E.message) assert(false) return }
+    assert(r2.payload == "200")
+    assert((r2.header("X-Echo-Req") ?? "") == "abc")
+
+    sub.unsubscribe() ! { assert(false) return }
+    await worker
+
+    // Request with no responder times out cleanly
+    let timed_out = false
+    requester.request("nobody.listening", "hello", 150) ! {
+        timed_out = error_is(E.code, timeout)
+    }
+    assert(timed_out)
+
+    // Responding to a message without reply subject fails with .invalid_subject
+    let no_reply = nats.Message { subject: "plain" }
+    let bad_resp = false
+    no_reply.respond("hi") ! { bad_resp = error_is(E.code, invalid_subject) }
+    assert(bad_resp)
+}
+
+fn serve_double(sub: nats.Subscription) {
+    while true {
+        let req = sub.next(2000) ! return
+        let n = req.payload.to_int() !? 0
+        let req_tag = req.header("X-Req")
+        if isset(req_tag) {
+            req.respond("" + (n * 2), .{ "X-Echo-Req" => req_tag }) _
+        } else {
+            req.respond("" + (n * 2)) _
+        }
+    }
+}
+
+test "UNSUB with max_msgs auto-unsubscribe" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let client = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer client.close()
+
+    let sub = client.subscribe("limited.topic") ! { assert(false) return }
+    sub.unsubscribe(2) ! { println(E.message) assert(false) return }
+    client.flush() ! { assert(false) return }
+
+    client.publish("limited.topic", "one") ! { assert(false) return }
+    client.publish("limited.topic", "two") ! { assert(false) return }
+    client.publish("limited.topic", "three") ! { assert(false) return }
+    client.flush() ! { assert(false) return }
+
+    let m1 = sub.next(2000) ! { assert(false) return }
+    let m2 = sub.next(2000) ! { assert(false) return }
+    assert(m1.payload == "one")
+    assert(m2.payload == "two")
+    assert(sub.closed)
+
+    // Third message was not delivered; next() throws .closed
+    let got_closed = false
+    sub.next(200) ! { got_closed = error_is(E.code, closed) }
+    assert(got_closed)
+}
+
+test "PING/PONG keepalive, flush, and async -ERR" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+    srv.send_ping_on_connect = true
+    srv.reject_subject = "forbidden.topic"
+
+    let client = nats.Client.connect(srv.url()) ! { println(E.message) assert(false) return }
+    defer client.close()
+
+    // Server PING sent on connect was answered with PONG
+    client.flush(2000) ! { println(E.message) assert(false) return }
+    assert(srv.pings_received >= 2)
+    assert(srv.pongs_received >= 1)
+
+    // Async -ERR is reported on flush and recorded in last_error
+    client.publish("forbidden.topic", "nope") ! { assert(false) return }
+    let got_server_err = false
+    client.flush(2000) ! {
+        got_server_err = error_is(E.code, server)
+    }
+    assert(got_server_err)
+    assert(client.last_error.contains("Permissions Violation"))
+
+    // Flush times out when server drops PONG
+    srv.drop_pongs = true
+    let flush_timed_out = false
+    client.flush(150) ! {
+        flush_timed_out = error_is(E.code, timeout)
+    }
+    assert(flush_timed_out)
+}
+
+test "Drain preserves in-flight messages and closes cleanly" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let client = nats.Client.connect(srv.url()) ! { assert(false) return }
+    let sub1 = client.subscribe("drain.a") ! { assert(false) return }
+    let sub2 = client.subscribe("drain.b") ! { assert(false) return }
+    client.flush() ! { assert(false) return }
+
+    // Drain a single subscription after publishing
+    client.publish("drain.a", "a1") ! { assert(false) return }
+    client.publish("drain.a", "a2") ! { assert(false) return }
+    sub1.drain(2000) ! { println(E.message) assert(false) return }
+    assert(sub1.closed)
+    assert((sub1.next(1000) ! { assert(false) return }).payload == "a1")
+    assert((sub1.next(1000) ! { assert(false) return }).payload == "a2")
+    let sub1_closed = false
+    sub1.next(100) ! { sub1_closed = error_is(E.code, closed) }
+    assert(sub1_closed)
+
+    // Drain the whole client after publishing to sub2
+    client.publish("drain.b", "b1") ! { assert(false) return }
+    client.publish("drain.b", "b2") ! { assert(false) return }
+    client.drain(2000) ! { println(E.message) assert(false) return }
+    assert(client.closed)
+    assert(sub2.closed)
+    assert((sub2.next(1000) ! { assert(false) return }).payload == "b1")
+    assert((sub2.next(1000) ! { assert(false) return }).payload == "b2")
+    let sub2_closed = false
+    sub2.next(100) ! { sub2_closed = error_is(E.code, closed) }
+    assert(sub2_closed)
+
+    // Publishing on a closed client throws .closed
+    let pub_closed = false
+    client.publish("drain.b", "after") ! { pub_closed = error_is(E.code, closed) }
+    assert(pub_closed)
+}
+
+test "Immediate close wakes blocked subscriber" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let client = nats.Client.connect(srv.url()) ! { assert(false) return }
+    let sub = client.subscribe("quiet.topic") ! { assert(false) return }
+    client.flush() ! { assert(false) return }
+
+    let waiter = co wait_for_closed(sub)
+    time.sleep_ms(30)
+    client.close()
+    assert(client.closed)
+    assert(sub.closed)
+    let was_closed = await waiter
+    assert(was_closed)
+}
+
+fn wait_for_closed(sub: nats.Subscription) bool {
+    sub.next(2000) ! {
+        return error_is(E.code, closed)
+    }
+    return false
+}
+
+test "No-echo option suppresses self-published messages" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let c1 = nats.Client.connect_with(nats.Config {
+        host: "127.0.0.1"
+        port: srv.port.to(u32)
+        echo: false
+    }) ! { assert(false) return }
+    defer c1.close()
+    let c2 = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer c2.close()
+
+    let s1 = c1.subscribe("chat.room") ! { assert(false) return }
+    let s2 = c2.subscribe("chat.room") ! { assert(false) return }
+    c1.flush() ! { assert(false) return }
+    c2.flush() ! { assert(false) return }
+
+    c1.publish("chat.room", "from-c1") ! { assert(false) return }
+    c2.publish("chat.room", "from-c2") ! { assert(false) return }
+
+    // c1 only receives c2's message
+    let m1 = s1.next(2000) ! { assert(false) return }
+    assert(m1.payload == "from-c2")
+    let s1_empty = false
+    s1.next(100) ! { s1_empty = error_is(E.code, timeout) }
+    assert(s1_empty)
+
+    // c2 receives both
+    assert((s2.next(2000) ! { assert(false) return }).payload == "from-c1")
+    assert((s2.next(2000) ! { assert(false) return }).payload == "from-c2")
+}
+
+test "Concurrent requests multiplex over shared inbox" {
+    let srv = FakeServer.start()
+    defer srv.stop()
+
+    let responder = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer responder.close()
+    let requester = nats.Client.connect(srv.url()) ! { assert(false) return }
+    defer requester.close()
+
+    let sub = responder.subscribe("math.double") ! { assert(false) return }
+    responder.flush() ! { assert(false) return }
+    let worker = co serve_double(sub)
+
+    let f1 = co run_double_req(requester, "5")
+    let f2 = co run_double_req(requester, "15")
+    let f3 = co run_double_req(requester, "25")
+    assert((await f1) == "10")
+    assert((await f2) == "30")
+    assert((await f3) == "50")
+
+    sub.unsubscribe() ! { assert(false) return }
+    await worker
+}
+
+fn run_double_req(client: nats.Client, input: String) String {
+    let reply = client.request("math.double", input, 2000) ! return "ERR:" + E.message
+    return reply.payload
+}
+
+test "TLS upgrade with CA verification and verify=false" {
+    let cert = __DIR__ + "/assets/cert.pem"
+    let key = __DIR__ + "/assets/key.pem"
+    let ctx: atomic net.SslServerContext = net.SslServerContext.new(cert, key) ! {
+        println("Failed to load test TLS cert")
+        assert(false)
+        return
+    }
+
+    let srv = FakeServer.start()
+    defer srv.stop()
+    srv.tls_required = true
+    srv.tls_context = ctx
+
+    // Verified TLS connection using ca_file
+    let c1 = nats.Client.connect_with(nats.Config {
+        host: "127.0.0.1"
+        port: srv.port.to(u32)
+        tls: nats.TlsOptions {
+            verify: true
+            ca_file: cert
+        }
+    }) ! { println(E.message) assert(false) return }
+    defer c1.close()
+    assert(c1.tls_active)
+    assert(c1.info.tls_required)
+
+    let sub = c1.subscribe("secure.topic") ! { assert(false) return }
+    c1.flush() ! { assert(false) return }
+    c1.publish("secure.topic", "encrypted-hello") ! { assert(false) return }
+    let msg = sub.next(2000) ! { assert(false) return }
+    assert(msg.payload == "encrypted-hello")
+
+    // Unverified TLS connection (verify: false) also succeeds
+    let c2 = nats.Client.connect_with(nats.Config {
+        host: "127.0.0.1"
+        port: srv.port.to(u32)
+        tls: nats.TlsOptions { verify: false }
+    }) ! { println(E.message) assert(false) return }
+    assert(c2.tls_active)
+    c2.flush() ! { assert(false) return }
+    c2.close()
+
+    // Default tls:// without CA rejects self-signed certificate with .tls
+    let tls_rejected = false
+    nats.Client.connect("tls://127.0.0.1:" + srv.port) ! {
+        tls_rejected = error_is(E.code, tls)
+    }
+    assert(tls_rejected)
+}

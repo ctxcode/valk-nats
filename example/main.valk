@@ -1,0 +1,38 @@
+use nats
+
+// Start a local NATS server (e.g. `nats-server`) before running `make example`.
+fn main() {
+    let client = nats.Client.connect("nats://127.0.0.1:4222") ! panic("Failed to connect: %{E.message}")
+    defer client.close()
+    println("Connected to NATS " + client.info.version + " (" + client.info.server_id + ")")
+
+    // Basic pub/sub with wildcards and headers
+    let sub = client.subscribe("events.*") ! panic("%{E.message}")
+    client.flush() ! panic("%{E.message}")
+
+    client.publish("events.signup", "ada@example.com", "", .{ "X-Source" => "example" }) ! panic("%{E.message}")
+    let event = sub.next(2000) ! panic("%{E.message}")
+    println("received " + event.subject + ": " + event.payload + " (X-Source=" + (event.header("X-Source") ?? "-") + ")")
+    sub.unsubscribe() ! panic("%{E.message}")
+
+    // Request / reply with a background responder coroutine
+    let svc = client.subscribe("greet.service", "greeters") ! panic("%{E.message}")
+    client.flush() ! panic("%{E.message}")
+    let responder = co handle_greet(svc)
+
+    let reply = client.request("greet.service", "Valk", 2000) ! panic("%{E.message}")
+    println("reply: " + reply.payload)
+
+    svc.unsubscribe() ! panic("%{E.message}")
+    await responder
+
+    // Graceful drain before exit
+    client.drain() ! panic("%{E.message}")
+}
+
+fn handle_greet(sub: nats.Subscription) {
+    let req = sub.next(2000) ! return
+    req.respond("Hello, " + req.payload + "!") ! {
+        println("respond failed: " + E.message)
+    }
+}

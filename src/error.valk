@@ -1,0 +1,13 @@
+/// Thrown by every operation of this package.
+///
+/// - `connect`: the TCP connection could not be opened, the URL was invalid, or reading/writing failed.
+/// - `tls`: the TLS handshake failed, or its settings could not be used.
+/// - `auth`: the server rejected the credentials or authorization failed.
+/// - `protocol`: the server sent unexpected wire bytes, or a message exceeded `max_payload`.
+/// - `server`: the server replied with a `-ERR` message.
+/// - `invalid_subject`: a subject, reply subject, or queue group was invalid.
+/// - `timeout`: `flush`, `next`, or `request` did not complete in time.
+/// - `closed`: the client or subscription is closed.
++ error Error (connect, tls, auth, protocol, server, invalid_subject, timeout, closed) payload {
+    message: String
+}
