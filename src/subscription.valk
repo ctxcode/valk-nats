@@ -29,19 +29,19 @@ use valk.sync
     /// been read.
     + fn next(timeout_ms: uint (0)) Message !Error {
         if this.dropped {
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
         this.ready.recv(timeout_ms) ! {
-            if error_is(E.code, timeout) {
-                throw .timeout { message: "Timed out waiting for message on '%{this.subject}'" }
+            if E is .timeout {
+                throw .timeout("Timed out waiting for message on '%{this.subject}'")
             }
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
         if this.dropped {
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
         return this.messages.pop_front() ! {
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
     }
 
@@ -50,14 +50,14 @@ use valk.sync
     /// Throws `closed` once the subscription is closed and empty.
     + fn try_next() ?Message !Error {
         if this.dropped {
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
         this.ready.try_recv() ! {
-            if error_is(E.code, empty) : return null
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            if E is .empty : return null
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
         if this.dropped {
-            throw .closed { message: "Subscription on '%{this.subject}' is closed" }
+            throw .closed("Subscription on '%{this.subject}' is closed")
         }
         return this.messages.pop_front() !? null
     }

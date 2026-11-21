@@ -2,7 +2,7 @@
 
 Pure-Valk [NATS](https://nats.io) messaging client for [Valk](https://valk-lang.dev), built on `valk.net`, `valk.sync`, `valk.json`, and `valk.crypto`. No external C or OS dependencies beyond Valk's standard library.
 
-Requires Valk 0.8.10 or newer.
+Requires Valk 0.9.1 or newer.
 
 ## Install
 

@@ -60,7 +60,7 @@ use valk.url
     let tls: ?TlsOptions = null
     if parts.scheme == "tls" : tls = TlsOptions {}
     else if parts.scheme != "nats" {
-        throw .connect { message: "'%{parts.scheme}' is not a valid NATS URL scheme" }
+        throw .connect("'%{parts.scheme}' is not a valid NATS URL scheme")
     }
 
     let decoded_user = url.decode(parts.user)

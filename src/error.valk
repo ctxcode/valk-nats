@@ -1,13 +1,38 @@
 /// Thrown by every operation of this package.
 ///
-/// - `connect`: the TCP connection could not be opened, the URL was invalid, or reading/writing failed.
-/// - `tls`: the TLS handshake failed, or its settings could not be used.
-/// - `auth`: the server rejected the credentials or authorization failed.
-/// - `protocol`: the server sent unexpected wire bytes, or a message exceeded `max_payload`.
-/// - `server`: the server replied with a `-ERR` message.
-/// - `invalid_subject`: a subject, reply subject, or queue group was invalid.
-/// - `timeout`: `flush`, `next`, or `request` did not complete in time.
-/// - `closed`: the client or subscription is closed.
-+ error Error (connect, tls, auth, protocol, server, invalid_subject, timeout, closed) payload {
-    message: String
+/// - `connect(message)`: the TCP connection could not be opened, the URL was invalid, or reading/writing failed.
+/// - `tls(message)`: the TLS handshake failed, or its settings could not be used.
+/// - `auth(message)`: the server rejected the credentials or authorization failed.
+/// - `protocol(message)`: the server sent unexpected wire bytes, or a message exceeded `max_payload`.
+/// - `server(message)`: the server replied with a `-ERR` message.
+/// - `invalid_subject(message)`: a subject, reply subject, or queue group was invalid.
+/// - `timeout(message)`: `flush`, `next`, or `request` did not complete in time.
+/// - `closed(message)`: the client or subscription is closed.
++ union Error {
+    connect(String)
+    tls(String)
+    auth(String)
+    protocol(String)
+    server(String)
+    invalid_subject(String)
+    timeout(String)
+    closed(String)
+
+    /// Returns the error description carried by any variant.
+    + get message: String {
+        return match this : String {
+            .connect(msg) => msg
+            .tls(msg) => msg
+            .auth(msg) => msg
+            .protocol(msg) => msg
+            .server(msg) => msg
+            .invalid_subject(msg) => msg
+            .timeout(msg) => msg
+            .closed(msg) => msg
+        }
+    }
+
+    + fn to_string() String $auto {
+        return this.message
+    }
 }

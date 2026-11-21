@@ -1,7 +1,7 @@
 use valk.json
 
 value CLIENT_LANG ("valk")
-value CLIENT_VERSION ("0.1.0")
+value CLIENT_VERSION ("0.2.0")
 value HEADER_VERSION ("NATS/1.0")
 
 /// Server metadata received in the NATS `INFO` message.
@@ -60,7 +60,7 @@ class ParsedHeaders {
 
 fn parse_server_info(json_text: String) ServerInfo !Error {
     return json.decode_to[ServerInfo](json_text) ! {
-        throw .protocol { message: "Invalid INFO payload from server: %{E.message}" }
+        throw .protocol("Invalid INFO payload from server: %{E.message}")
     }
 }
 
@@ -89,10 +89,10 @@ fn encode_headers(headers: Map[String]) String !Error {
     out.write("\r\n")
     each headers as val, key {
         if key.length == 0 || has_crlf(key) || key.contains(":") {
-            throw .protocol { message: "Invalid NATS header key '%{key}'" }
+            throw .protocol("Invalid NATS header key '%{key}'")
         }
         if has_crlf(val) {
-            throw .protocol { message: "Invalid NATS header value for '%{key}'" }
+            throw .protocol("Invalid NATS header value for '%{key}'")
         }
         out.write(key)
         out.write(": ")
@@ -109,9 +109,9 @@ fn parse_headers(raw: String) ParsedHeaders !Error {
     if raw.length == 0 : return result
 
     let lines = raw.split("\r\n")
-    let first = lines.get(0) ! throw .protocol { message: "Empty NATS header block" }
+    let first = lines.get(0) ! throw .protocol("Empty NATS header block")
     if !first.starts_with(HEADER_VERSION) {
-        throw .protocol { message: "Unexpected NATS header version line: '%{first}'" }
+        throw .protocol("Unexpected NATS header version line: '%{first}'")
     }
     if first.length > HEADER_VERSION.length {
         let rest = first.range(HEADER_VERSION.length, first.length - HEADER_VERSION.length).trim(" ")

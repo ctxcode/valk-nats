@@ -7,13 +7,6 @@ Namespaces: [main](#main)
 
 # main
 
-## Errors for 'main'
-
-```js
-// Thrown by every operation of this package.
-+ error Error (connect, tls, auth, protocol, server, invalid_subject, timeout, closed) payload { message: String }
-```
-
 ## Functions for 'main'
 
 ```js
@@ -99,6 +92,24 @@ Namespaces: [main](#main)
     + user: String
     // Ask the server to acknowledge every command with `+OK`.
     + verbose: bool
+}
+```
+
+```js
+// Thrown by every operation of this package.
++ union Error {
+    connect(String)
+    tls(String)
+    auth(String)
+    protocol(String)
+    server(String)
+    invalid_subject(String)
+    timeout(String)
+    closed(String)
+
+    // Returns the error description carried by any variant.
+    + get message: String
+    + fn to_string() String
 }
 ```
 

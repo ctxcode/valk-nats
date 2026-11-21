@@ -53,7 +53,7 @@ test "Auth user/pass success and failure" {
     // Wrong password fails with .auth
     let auth_failed = false
     nats.Client.connect("nats://alice:wrong@127.0.0.1:" + srv.port) ! {
-        auth_failed = error_is(E.code, auth)
+        auth_failed = E is .auth
     }
     assert(auth_failed)
 }
@@ -75,7 +75,7 @@ test "Auth token success and failure" {
         port: srv.port.to(u32)
         auth_token: "bad-token"
     }) ! {
-        auth_failed = error_is(E.code, auth)
+        auth_failed = E is .auth
     }
     assert(auth_failed)
 }
@@ -120,7 +120,7 @@ test "Publish and subscribe exact, wildcards, and binary payloads" {
     assert((star.next(2000) ! { assert(false) return }).payload == binary)
     assert((star.next(2000) ! { assert(false) return }).payload == "")
     let star_timed_out = false
-    star.next(100) ! { star_timed_out = error_is(E.code, timeout) }
+    star.next(100) ! { star_timed_out = E is .timeout }
     assert(star_timed_out)
 
     // gt received all 4 messages in order
@@ -141,23 +141,23 @@ test "Invalid subjects and max_payload checks" {
     defer client.close()
 
     let bad_pub = false
-    client.publish("bad subject", "x") ! { bad_pub = error_is(E.code, invalid_subject) }
+    client.publish("bad subject", "x") ! { bad_pub = E is .invalid_subject }
     assert(bad_pub)
 
     let wildcard_pub = false
-    client.publish("foo.*", "x") ! { wildcard_pub = error_is(E.code, invalid_subject) }
+    client.publish("foo.*", "x") ! { wildcard_pub = E is .invalid_subject }
     assert(wildcard_pub)
 
     let bad_sub = false
-    client.subscribe("foo..bar") ! { bad_sub = error_is(E.code, invalid_subject) }
+    client.subscribe("foo..bar") ! { bad_sub = E is .invalid_subject }
     assert(bad_sub)
 
     let bad_queue = false
-    client.subscribe("foo.bar", "bad queue") ! { bad_queue = error_is(E.code, invalid_subject) }
+    client.subscribe("foo.bar", "bad queue") ! { bad_queue = E is .invalid_subject }
     assert(bad_queue)
 
     let too_big = false
-    client.publish("foo.bar", "01234567890123456789") ! { too_big = error_is(E.code, protocol) }
+    client.publish("foo.bar", "01234567890123456789") ! { too_big = E is .protocol }
     assert(too_big)
 }
 
@@ -245,7 +245,7 @@ test "HPUB and HMSG headers round-trip" {
     // Invalid header key with CRLF rejected
     let bad_hdr = false
     client.publish("orders.created", "x", "", .{ "Bad\r\nKey" => "v" }) ! {
-        bad_hdr = error_is(E.code, protocol)
+        bad_hdr = E is .protocol
     }
     assert(bad_hdr)
 }
@@ -278,14 +278,14 @@ test "Request and respond success, headers, and timeout" {
     // Request with no responder times out cleanly
     let timed_out = false
     requester.request("nobody.listening", "hello", 150) ! {
-        timed_out = error_is(E.code, timeout)
+        timed_out = E is .timeout
     }
     assert(timed_out)
 
     // Responding to a message without reply subject fails with .invalid_subject
     let no_reply = nats.Message { subject: "plain" }
     let bad_resp = false
-    no_reply.respond("hi") ! { bad_resp = error_is(E.code, invalid_subject) }
+    no_reply.respond("hi") ! { bad_resp = E is .invalid_subject }
     assert(bad_resp)
 }
 
@@ -326,7 +326,7 @@ test "UNSUB with max_msgs auto-unsubscribe" {
 
     // Third message was not delivered; next() throws .closed
     let got_closed = false
-    sub.next(200) ! { got_closed = error_is(E.code, closed) }
+    sub.next(200) ! { got_closed = E is .closed }
     assert(got_closed)
 }
 
@@ -348,7 +348,7 @@ test "PING/PONG keepalive, flush, and async -ERR" {
     client.publish("forbidden.topic", "nope") ! { assert(false) return }
     let got_server_err = false
     client.flush(2000) ! {
-        got_server_err = error_is(E.code, server)
+        got_server_err = E is .server
     }
     assert(got_server_err)
     assert(client.last_error.contains("Permissions Violation"))
@@ -357,7 +357,7 @@ test "PING/PONG keepalive, flush, and async -ERR" {
     srv.drop_pongs = true
     let flush_timed_out = false
     client.flush(150) ! {
-        flush_timed_out = error_is(E.code, timeout)
+        flush_timed_out = E is .timeout
     }
     assert(flush_timed_out)
 }
@@ -379,7 +379,7 @@ test "Drain preserves in-flight messages and closes cleanly" {
     assert((sub1.next(1000) ! { assert(false) return }).payload == "a1")
     assert((sub1.next(1000) ! { assert(false) return }).payload == "a2")
     let sub1_closed = false
-    sub1.next(100) ! { sub1_closed = error_is(E.code, closed) }
+    sub1.next(100) ! { sub1_closed = E is .closed }
     assert(sub1_closed)
 
     // Drain the whole client after publishing to sub2
@@ -391,12 +391,12 @@ test "Drain preserves in-flight messages and closes cleanly" {
     assert((sub2.next(1000) ! { assert(false) return }).payload == "b1")
     assert((sub2.next(1000) ! { assert(false) return }).payload == "b2")
     let sub2_closed = false
-    sub2.next(100) ! { sub2_closed = error_is(E.code, closed) }
+    sub2.next(100) ! { sub2_closed = E is .closed }
     assert(sub2_closed)
 
     // Publishing on a closed client throws .closed
     let pub_closed = false
-    client.publish("drain.b", "after") ! { pub_closed = error_is(E.code, closed) }
+    client.publish("drain.b", "after") ! { pub_closed = E is .closed }
     assert(pub_closed)
 }
 
@@ -419,7 +419,7 @@ test "Immediate close wakes blocked subscriber" {
 
 fn wait_for_closed(sub: nats.Subscription) bool {
     sub.next(2000) ! {
-        return error_is(E.code, closed)
+        return E is .closed
     }
     return false
 }
@@ -449,7 +449,7 @@ test "No-echo option suppresses self-published messages" {
     let m1 = s1.next(2000) ! { assert(false) return }
     assert(m1.payload == "from-c2")
     let s1_empty = false
-    s1.next(100) ! { s1_empty = error_is(E.code, timeout) }
+    s1.next(100) ! { s1_empty = E is .timeout }
     assert(s1_empty)
 
     // c2 receives both
@@ -532,7 +532,7 @@ test "TLS upgrade with CA verification and verify=false" {
     // Default tls:// without CA rejects self-signed certificate with .tls
     let tls_rejected = false
     nats.Client.connect("tls://127.0.0.1:" + srv.port) ! {
-        tls_rejected = error_is(E.code, tls)
+        tls_rejected = E is .tls
     }
     assert(tls_rejected)
 }

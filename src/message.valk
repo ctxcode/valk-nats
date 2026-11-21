@@ -25,9 +25,9 @@
     /// client is closed.
     + fn respond(payload: String, headers: ?Map[String] (null)) !Error {
         if this.reply.length == 0 {
-            throw .invalid_subject { message: "Cannot respond to message on '%{this.subject}': no reply subject" }
+            throw .invalid_subject("Cannot respond to message on '%{this.subject}': no reply subject")
         }
-        let client = this.client ?! throw .closed { message: "Message is not associated with an active client" }
+        let client = this.client ?! throw .closed("Message is not associated with an active client")
         client.publish(this.reply, payload, "", headers) !>
     }
 }

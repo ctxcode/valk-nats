@@ -116,7 +116,7 @@ test "Config from URL" {
     // Invalid scheme rejected
     let failed = false
     nats.config_from_url("http://127.0.0.1:4222") ! {
-        failed = error_is(E.code, connect)
+        failed = E is .connect
     }
     assert(failed)
 }

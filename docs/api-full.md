@@ -7,26 +7,6 @@ Namespaces: [main](#main)
 
 # main
 
-## Errors for 'main'
-
-```js
-// Thrown by every operation of this package.
-+ error Error (connect, tls, auth, protocol, server, invalid_subject, timeout, closed) payload { message: String }
-```
-
-### Error
-
-Thrown by every operation of this package.
-
-- `connect`: the TCP connection could not be opened, the URL was invalid, or reading/writing failed.
-- `tls`: the TLS handshake failed, or its settings could not be used.
-- `auth`: the server rejected the credentials or authorization failed.
-- `protocol`: the server sent unexpected wire bytes, or a message exceeded `max_payload`.
-- `server`: the server replied with a `-ERR` message.
-- `invalid_subject`: a subject, reply subject, or queue group was invalid.
-- `timeout`: `flush`, `next`, or `request` did not complete in time.
-- `closed`: the client or subscription is closed.
-
 ## Functions for 'main'
 
 ```js
@@ -273,6 +253,41 @@ Username for user/pass authentication.
 #### verbose
 
 Ask the server to acknowledge every command with `+OK`.
+
+```js
+// Thrown by every operation of this package.
++ union Error {
+    connect(String)
+    tls(String)
+    auth(String)
+    protocol(String)
+    server(String)
+    invalid_subject(String)
+    timeout(String)
+    closed(String)
+
+    // Returns the error description carried by any variant.
+    + get message: String
+    + fn to_string() String
+}
+```
+
+### Error
+
+Thrown by every operation of this package.
+
+- `connect(message)`: the TCP connection could not be opened, the URL was invalid, or reading/writing failed.
+- `tls(message)`: the TLS handshake failed, or its settings could not be used.
+- `auth(message)`: the server rejected the credentials or authorization failed.
+- `protocol(message)`: the server sent unexpected wire bytes, or a message exceeded `max_payload`.
+- `server(message)`: the server replied with a `-ERR` message.
+- `invalid_subject(message)`: a subject, reply subject, or queue group was invalid.
+- `timeout(message)`: `flush`, `next`, or `request` did not complete in time.
+- `closed(message)`: the client or subscription is closed.
+
+#### message
+
+Returns the error description carried by any variant.
 
 ```js
 // A message received from a NATS subscription or request reply.
